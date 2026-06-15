@@ -1,0 +1,33 @@
+# ── Secrets ──
+.env
+.env.local
+*.key
+*.pem
+credentials.json
+web_users.json
+web_users.json.tmp
+.claude/
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ── Scan output ──
+results/
+easm_state.db
+easm_state.db-journal
+easm_report_*.json
+easm_report_*.txt
+easm_report_*.html
+
+# ── Editor / OS ──
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
