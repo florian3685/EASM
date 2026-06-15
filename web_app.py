@@ -71,6 +71,53 @@ USER_ROLES = [
 ]
 ROLE_IDS = {role["id"] for role in USER_ROLES}
 USER_LOCK = threading.RLock()
+ENV_FILE = BASE_DIR / ".env"
+
+API_KEY_FIELDS = [
+    {
+        "env": "VT_API_KEY",
+        "config_key": "virustotal",
+        "label": "VirusTotal",
+        "description": "Domain/IP reputation lookups and malware intelligence.",
+    },
+    {
+        "env": "HIBP_API_KEY",
+        "config_key": "hibp",
+        "label": "Have I Been Pwned",
+        "description": "Breach lookups for customer-domain email exposure.",
+    },
+    {
+        "env": "ABUSEIPDB_API_KEY",
+        "config_key": "abuseipdb",
+        "label": "AbuseIPDB",
+        "description": "Abuse confidence and IP reputation checks.",
+    },
+    {
+        "env": "GSB_API_KEY",
+        "config_key": "google_safebrowsing",
+        "label": "Google Safe Browsing",
+        "description": "Phishing and malware reputation checks.",
+    },
+    {
+        "env": "SHODAN_API_KEY",
+        "config_key": "shodan",
+        "label": "Shodan",
+        "description": "Passive exposure, banner and CVE enrichment.",
+    },
+    {
+        "env": "GITHUB_TOKEN",
+        "config_key": "github",
+        "label": "GitHub Token",
+        "description": "GitHub code search for domain-related leaks.",
+    },
+    {
+        "env": "EASM_WEBHOOK_URL",
+        "config_key": None,
+        "label": "Alert Webhook",
+        "description": "Optional Slack/Discord webhook for scan-diff notifications.",
+    },
+]
+API_KEY_ENVS = {field["env"] for field in API_KEY_FIELDS}
 
 DEFAULT_MODULES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14]
 MODULE_DESCRIPTIONS = {
@@ -171,6 +218,113 @@ def parse_modules(raw_modules: Any) -> list[int]:
     if invalid:
         raise ValueError(f"Invalid module selection: {invalid}")
     return modules
+
+
+def mask_secret(value: str) -> str:
+    value = value or ""
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "configured"
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def quote_env_value(value: str) -> str:
+    escaped = (value or "").replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def api_key_current_value(field: dict[str, Any]) -> str:
+    env_name = str(field["env"])
+    config_key = field.get("config_key")
+    if config_key:
+        return str(config.API_KEYS.get(str(config_key), "") or "")
+    if env_name == "EASM_WEBHOOK_URL":
+        return str(getattr(config, "WEBHOOK_URL", "") or os.environ.get(env_name, "") or "")
+    return str(os.environ.get(env_name, "") or "")
+
+
+def list_api_key_status() -> list[dict[str, Any]]:
+    rows = []
+    for field in API_KEY_FIELDS:
+        value = api_key_current_value(field)
+        rows.append({
+            "env": field["env"],
+            "label": field["label"],
+            "description": field["description"],
+            "configured": bool(value),
+            "masked": mask_secret(value),
+        })
+    return rows
+
+
+def write_env_values(changes: dict[str, str]) -> None:
+    existing_lines = ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.exists() else []
+    pending = {key: value for key, value in changes.items() if key in API_KEY_ENVS}
+    written: set[str] = set()
+    output: list[str] = []
+
+    for line in existing_lines:
+        match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        if match and match.group(1) in pending:
+            key = match.group(1)
+            output.append(f"{key}={quote_env_value(pending[key])}")
+            written.add(key)
+        else:
+            output.append(line)
+
+    if pending.keys() - written:
+        if output and output[-1].strip():
+            output.append("")
+        output.append("# link-ed.it CyberScan API keys")
+        for key in sorted(pending.keys() - written):
+            output.append(f"{key}={quote_env_value(pending[key])}")
+
+    tmp_path = ENV_FILE.with_suffix(".env.tmp")
+    tmp_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+    os.replace(tmp_path, ENV_FILE)
+    try:
+        os.chmod(ENV_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def update_api_keys(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_values = payload.get("values", {})
+    clear_values = set(payload.get("clear", []) or [])
+    if not isinstance(raw_values, dict):
+        raise ValueError("values must be an object.")
+
+    changes: dict[str, str] = {}
+    for env_name, value in raw_values.items():
+        env_name = str(env_name)
+        if env_name not in API_KEY_ENVS:
+            continue
+        value = str(value or "").strip()
+        if value:
+            changes[env_name] = value
+
+    for env_name in clear_values:
+        env_name = str(env_name)
+        if env_name in API_KEY_ENVS:
+            changes[env_name] = ""
+
+    if not changes:
+        return list_api_key_status()
+
+    write_env_values(changes)
+    for field in API_KEY_FIELDS:
+        env_name = str(field["env"])
+        if env_name not in changes:
+            continue
+        value = changes[env_name]
+        os.environ[env_name] = value
+        config_key = field.get("config_key")
+        if config_key:
+            config.API_KEYS[str(config_key)] = value
+        elif env_name == "EASM_WEBHOOK_URL":
+            config.WEBHOOK_URL = value
+    return list_api_key_status()
 
 
 def parse_web_users(raw: str) -> dict[str, str]:
@@ -792,6 +946,7 @@ def app_bootstrap(username: str) -> dict[str, Any]:
         "can_scan": can_start_scan(username),
         "roles": USER_ROLES,
         "users": list_managed_users() if is_admin_user(username) else [],
+        "api_key_status": list_api_key_status() if is_admin_user(username) else [],
         "max_workers": max(1, MAX_WORKERS),
         "jobs": JOBS.list(),
         "reports": list_reports(),
@@ -908,7 +1063,10 @@ class WebHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._send(303, b"", "text/plain; charset=utf-8", {"Location": "/dashboard"})
             return
-        if path in {"/dashboard", "/scans", "/reports", "/admin", "/index.html"}:
+        if path == "/admin":
+            self._send(303, b"", "text/plain; charset=utf-8", {"Location": "/admin/users"})
+            return
+        if path in {"/dashboard", "/scans", "/reports", "/admin/users", "/admin/api-keys", "/index.html"}:
             self._send(200, APP_HTML.encode("utf-8"))
             return
         if path == "/api/bootstrap":
@@ -932,6 +1090,11 @@ class WebHandler(BaseHTTPRequestHandler):
             if not self._require_admin():
                 return
             self._json(200, {"users": list_managed_users(), "roles": USER_ROLES})
+            return
+        if path == "/api/admin/api-keys":
+            if not self._require_admin():
+                return
+            self._json(200, {"api_keys": list_api_key_status()})
             return
         if path.startswith("/reports/"):
             try:
@@ -966,7 +1129,13 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if path in {"/", "/dashboard", "/scans", "/reports", "/admin", "/index.html"}:
+        if path == "/admin":
+            self.send_response(303)
+            self.send_header("Location", "/admin/users")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path in {"/", "/dashboard", "/scans", "/reports", "/admin/users", "/admin/api-keys", "/index.html"}:
             body = APP_HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1088,6 +1257,16 @@ class WebHandler(BaseHTTPRequestHandler):
                     updated_by=self._current_user() or "local",
                 )
                 self._json(200, {"user": user, "users": list_managed_users()})
+            except Exception as exc:
+                self._json(400, {"error": str(exc)})
+            return
+
+        if path == "/api/admin/api-keys":
+            if not self._require_admin():
+                return
+            try:
+                payload = self._read_json()
+                self._json(200, {"api_keys": update_api_keys(payload)})
             except Exception as exc:
                 self._json(400, {"error": str(exc)})
             return
@@ -1566,10 +1745,12 @@ APP_HTML = """<!doctype html>
     .workspace { display: grid; gap: 18px; }
     .layout.route-reports,
     .layout.route-dashboard,
-    .layout.route-admin { grid-template-columns: minmax(0, 1fr); }
+    .layout.route-admin-users,
+    .layout.route-admin-api-keys { grid-template-columns: minmax(0, 1fr); }
     .layout.route-reports .workspace,
     .layout.route-dashboard .workspace,
-    .layout.route-admin .workspace { max-width: 1200px; width: 100%; margin: 0 auto; }
+    .layout.route-admin-users .workspace,
+    .layout.route-admin-api-keys .workspace { max-width: 1200px; width: 100%; margin: 0 auto; }
 
     /* ---------- Panels ---------- */
     .panel {
@@ -1841,6 +2022,67 @@ APP_HTML = """<!doctype html>
       text-transform: none;
       letter-spacing: 0;
     }
+    .key-list {
+      display: grid;
+      gap: 12px;
+    }
+    .key-row {
+      display: grid;
+      grid-template-columns: minmax(220px, .85fr) minmax(260px, 1fr) 120px;
+      gap: 14px;
+      align-items: start;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface-2);
+      padding: 16px;
+    }
+    .key-row h3 {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 700;
+      color: #f6f8ff;
+    }
+    .key-row p {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .key-row code {
+      display: inline-flex;
+      margin-top: 8px;
+      color: #7df3df;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .key-controls {
+      display: grid;
+      gap: 8px;
+    }
+    .key-clear {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .key-status {
+      justify-self: end;
+      align-self: start;
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .03em;
+      background: rgba(244, 63, 94, .16);
+      color: #fda4af;
+    }
+    .key-status.on {
+      background: rgba(45, 212, 191, .16);
+      color: #7df3df;
+    }
 
     /* ---------- Dashboard overview ---------- */
     .dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(280px, .9fr); gap: 16px; }
@@ -1940,6 +2182,8 @@ APP_HTML = """<!doctype html>
       .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .admin-grid { grid-template-columns: 1fr; }
       .dashboard-grid { grid-template-columns: 1fr; }
+      .key-row { grid-template-columns: 1fr; }
+      .key-status { justify-self: start; }
     }
     @media (max-width: 560px) {
       .modules, .profiles { grid-template-columns: 1fr; }
@@ -1964,7 +2208,8 @@ APP_HTML = """<!doctype html>
       <a href="/dashboard" data-route-link="dashboard">Dashboard</a>
       <a href="/scans" data-route-link="scans">Scans</a>
       <a href="/reports" data-route-link="reports">Reports</a>
-      <a href="/admin" data-route-link="admin">Admin</a>
+      <a href="/admin/users" data-route-link="admin-users" data-admin-only="true">Users</a>
+      <a href="/admin/api-keys" data-route-link="admin-api-keys" data-admin-only="true">API Keys</a>
     </nav>
     <div class="top-actions">
       <div id="apiKeys" class="api-strip"></div>
@@ -2061,7 +2306,7 @@ APP_HTML = """<!doctype html>
 
       <section id="adminPanel" class="panel route-hidden" hidden>
         <div class="panel-head">
-          <h2>Admin</h2>
+          <h2>User Management</h2>
         </div>
         <div class="panel-body">
           <div class="admin-grid">
@@ -2086,6 +2331,19 @@ APP_HTML = """<!doctype html>
           </div>
         </div>
       </section>
+
+      <section id="apiKeysPanel" class="panel route-hidden" hidden>
+        <div class="panel-head">
+          <h2>API Keys</h2>
+        </div>
+        <div class="panel-body">
+          <div id="apiKeyEditor"></div>
+          <div class="actions">
+            <button id="saveApiKeys" class="primary" type="button">Save API keys</button>
+          </div>
+          <div id="apiKeyNotice" class="notice"></div>
+        </div>
+      </section>
     </div>
   </main>
 
@@ -2095,6 +2353,7 @@ APP_HTML = """<!doctype html>
       profiles: [],
       roles: [],
       users: [],
+      apiKeys: [],
       selectedProfile: "full_recon",
       route: routeFromPath(),
       user: "local",
@@ -2108,14 +2367,22 @@ APP_HTML = """<!doctype html>
     function routeFromPath() {
       if (location.pathname === "/dashboard") return "dashboard";
       if (location.pathname === "/reports") return "reports";
-      if (location.pathname === "/admin") return "admin";
+      if (location.pathname === "/admin" || location.pathname === "/admin/users") return "admin-users";
+      if (location.pathname === "/admin/api-keys") return "admin-api-keys";
       if (location.pathname === "/scans") return "scans";
       return "dashboard";
     }
 
     function setRoute(route, replace = false) {
       state.route = route;
-      const path = `/${route}`;
+      const paths = {
+        "dashboard": "/dashboard",
+        "scans": "/scans",
+        "reports": "/reports",
+        "admin-users": "/admin/users",
+        "admin-api-keys": "/admin/api-keys"
+      };
+      const path = paths[route] || "/dashboard";
       if (location.pathname !== path) {
         history[replace ? "replaceState" : "pushState"]({}, "", path);
       }
@@ -2128,7 +2395,7 @@ APP_HTML = """<!doctype html>
     }
 
     function renderRoute() {
-      if (state.route === "admin" && !state.isAdmin) {
+      if (state.route.startsWith("admin-") && !state.isAdmin) {
         setRoute("dashboard", true);
         return;
       }
@@ -2138,10 +2405,11 @@ APP_HTML = """<!doctype html>
       toggleRouteNode("dashboardPanel", state.route === "dashboard");
       toggleRouteNode("jobsPanel", state.route === "scans");
       toggleRouteNode("reportsPanel", state.route === "reports");
-      toggleRouteNode("adminPanel", state.route === "admin" && state.isAdmin);
+      toggleRouteNode("adminPanel", state.route === "admin-users" && state.isAdmin);
+      toggleRouteNode("apiKeysPanel", state.route === "admin-api-keys" && state.isAdmin);
       document.querySelectorAll("[data-route-link]").forEach((node) => {
-        const isAdminLink = node.dataset.routeLink === "admin";
-        node.style.display = isAdminLink && !state.isAdmin ? "none" : "inline-flex";
+        const adminOnly = node.dataset.adminOnly === "true";
+        node.style.display = adminOnly && !state.isAdmin ? "none" : "inline-flex";
         node.classList.toggle("active", node.dataset.routeLink === state.route);
       });
     }
@@ -2152,6 +2420,10 @@ APP_HTML = """<!doctype html>
 
     function showAdminNotice(message) {
       setNotice("adminNotice", message);
+    }
+
+    function showApiKeyNotice(message) {
+      setNotice("apiKeyNotice", message);
     }
 
     function setNotice(id, message) {
@@ -2366,9 +2638,36 @@ APP_HTML = """<!doctype html>
       state.users = users || [];
       state.roles = roles || [];
       $("adminPanel").hidden = false;
+      $("apiKeysPanel").hidden = false;
       if (!state.isAdmin) return;
       renderAdminRoles();
       renderUsers();
+    }
+
+    function renderApiKeyEditor(apiKeys) {
+      state.apiKeys = apiKeys || [];
+      if (!state.isAdmin) return;
+      if (!state.apiKeys.length) {
+        $("apiKeyEditor").innerHTML = `<div class="empty">No API key definitions found.</div>`;
+        return;
+      }
+      $("apiKeyEditor").innerHTML = `<div class="key-list">${state.apiKeys.map((key) => `
+        <div class="key-row">
+          <div>
+            <h3>${escapeHtml(key.label)}</h3>
+            <p>${escapeHtml(key.description)}</p>
+            <code>${escapeHtml(key.env)}${key.masked ? ` · ${escapeHtml(key.masked)}` : ""}</code>
+          </div>
+          <div class="key-controls">
+            <input data-api-key="${escapeHtml(key.env)}" type="password" placeholder="${key.configured ? "leave blank to keep current key" : "paste API key"}" autocomplete="off">
+            <label class="key-clear">
+              <input data-api-clear="${escapeHtml(key.env)}" type="checkbox">
+              Clear saved value
+            </label>
+          </div>
+          <span class="key-status ${key.configured ? "on" : ""}">${key.configured ? "configured" : "missing"}</span>
+        </div>
+      `).join("")}</div>`;
     }
 
     function renderUsers() {
@@ -2433,6 +2732,7 @@ APP_HTML = """<!doctype html>
       renderMetrics(data.jobs, data.reports, data.max_workers);
       renderDashboard(data.jobs, data.reports);
       renderAdminPanel(data.is_admin, data.users, data.roles);
+      renderApiKeyEditor(data.api_key_status || []);
       renderRoute();
     }
 
@@ -2517,6 +2817,41 @@ APP_HTML = """<!doctype html>
       }
     }
 
+    async function saveApiKeys() {
+      showApiKeyNotice("");
+      const values = {};
+      const clear = [];
+      document.querySelectorAll("[data-api-key]").forEach((node) => {
+        const value = node.value.trim();
+        if (value) values[node.dataset.apiKey] = value;
+      });
+      document.querySelectorAll("[data-api-clear]:checked").forEach((node) => {
+        clear.push(node.dataset.apiClear);
+      });
+      if (!Object.keys(values).length && !clear.length) {
+        showApiKeyNotice("No API key changes to save.");
+        return;
+      }
+      $("saveApiKeys").disabled = true;
+      try {
+        const response = await fetch("/api/admin/api-keys", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ values, clear })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "API keys could not be saved.");
+        state.apiKeys = data.api_keys || [];
+        renderApiKeyEditor(state.apiKeys);
+        showApiKeyNotice("API keys saved.");
+        await load();
+      } catch (error) {
+        showApiKeyNotice(error.message);
+      } finally {
+        $("saveApiKeys").disabled = false;
+      }
+    }
+
     function escapeHtml(value) {
       return String(value ?? "").replace(/[&<>"']/g, (char) => ({
         "&": "&amp;",
@@ -2536,6 +2871,7 @@ APP_HTML = """<!doctype html>
 
     $("startScan").addEventListener("click", startScan);
     $("saveUser").addEventListener("click", saveUser);
+    $("saveApiKeys").addEventListener("click", saveApiKeys);
     document.querySelectorAll("[data-route-link]").forEach((node) => {
       node.addEventListener("click", (event) => {
         event.preventDefault();

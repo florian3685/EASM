@@ -18,7 +18,8 @@ Open `http://127.0.0.1:18080/setup` first and create the initial admin user.
 - `/dashboard` - overview, latest scan, latest PDFs and recent report files
 - `/scans` - start authorized customer-domain scans and watch jobs
 - `/reports` - browse generated JSON, HTML and PDF reports
-- `/admin` - manage employee users and roles
+- `/admin/users` - manage employee users and roles
+- `/admin/api-keys` - manage scan-provider API keys without exposing values in the UI
 
 ## Security Notes
 

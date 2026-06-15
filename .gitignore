@@ -1,5 +1,6 @@
 # ── Secrets ──
 .env
+.env.tmp
 .env.local
 *.key
 *.pem
