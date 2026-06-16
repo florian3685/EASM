@@ -163,6 +163,8 @@ def run_module(module_num: int, domain: str, results_so_far: dict,
 
             result = mod.run(domain, endpoints, params, port_results,
                              on_endpoint_done=_ep_done)
+        elif module_num == 1:
+            result = mod.run(domain, on_progress=on_progress)
         elif module_num == 12:
             # Reuse subdomains discovered in Module 1 if available
             subs = []

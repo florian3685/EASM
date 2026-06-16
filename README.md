@@ -13,6 +13,14 @@ python3 web_app.py --host 127.0.0.1 --port 18080
 
 Open `http://127.0.0.1:18080/setup` first and create the initial admin user.
 
+## Server Deployment
+
+Use `docs/DEPLOYMENT.md` plus the files in `deploy/` for a server install with:
+
+- app code in `/opt/cyberscan`
+- employee accounts, reports and scan state in `/var/lib/cyberscan`
+- secrets and API keys in `/etc/cyberscan/cyberscan.env`
+
 ## Portal Routes
 
 - `/dashboard` - overview, latest scan, latest PDFs and recent report files

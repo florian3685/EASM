@@ -11,7 +11,7 @@
 #    ./run.sh example.com --stealth    # add stealth mode
 #    ./run.sh example.com --safe       # passive only (no module 11)
 #    ./run.sh example.com --fresh      # ignore checkpoint, start over
-#    ./run.sh --web                    # shared web console on 0.0.0.0:8080
+#    ./run.sh --web                    # shared web console on 0.0.0.0:18080
 #    ./run.sh --status                 # show API key status
 #    ./run.sh --setup                  # interactive API key setup
 #
@@ -88,7 +88,7 @@ case "${1:-}" in
         echo "  ./run.sh <domain>              scan domain — ALL 14 modules + exploit"
         echo "  ./run.sh <domain> --stealth    + jitter & evasion headers"
         echo "  ./run.sh <domain> --safe       passive only, no exploitation (no module 11)"
-        echo "  ./run.sh --web                 shared web console on 0.0.0.0:8080"
+        echo "  ./run.sh --web                 shared web console on 0.0.0.0:18080"
         echo "  ./run.sh --status              show API key status"
         echo "  ./run.sh --setup               interactive API key setup"
         echo

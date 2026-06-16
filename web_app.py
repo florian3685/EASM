@@ -48,11 +48,13 @@ from state_manager import StateTracker
 
 
 BASE_DIR = Path(__file__).resolve().parent
-RESULTS_DIR = BASE_DIR / "results"
+DATA_DIR = Path(os.environ.get("EASM_DATA_DIR", str(BASE_DIR))).resolve()
+RESULTS_DIR = Path(os.environ.get("EASM_RESULTS_DIR", str(DATA_DIR / "results"))).resolve()
 APP_TITLE = "link-ed.it CyberScan"
 APP_TAGLINE = "Internal customer-domain security scans"
 COMPANY_NAME = "link-ed.it"
-USERS_FILE = Path(os.environ.get("EASM_WEB_USERS_FILE", str(BASE_DIR / "web_users.json")))
+USERS_FILE = Path(os.environ.get("EASM_WEB_USERS_FILE", str(DATA_DIR / "web_users.json"))).resolve()
+STATE_DB = Path(os.environ.get("EASM_STATE_DB", str(DATA_DIR / "easm_state.db"))).resolve()
 WEB_TOKEN = os.environ.get("EASM_WEB_TOKEN", "").strip()
 WEB_USERS_RAW = os.environ.get("EASM_WEB_USERS", "").strip()
 SESSION_COOKIE = "easm_session"
@@ -71,7 +73,12 @@ USER_ROLES = [
 ]
 ROLE_IDS = {role["id"] for role in USER_ROLES}
 USER_LOCK = threading.RLock()
-ENV_FILE = BASE_DIR / ".env"
+ENV_FILE = Path(
+    os.environ.get(
+        "EASM_ENV_FILE",
+        str(DATA_DIR / ".env" if "EASM_DATA_DIR" in os.environ else BASE_DIR / ".env"),
+    )
+).resolve()
 
 API_KEY_FIELDS = [
     {
@@ -659,6 +666,15 @@ def public_path(path: Path) -> str:
     return "/reports/" + "/".join(rel.parts)
 
 
+def public_download_path(path: Path) -> str:
+    return f"{public_path(path)}?download=1"
+
+
+def attachment_headers(path: Path) -> dict[str, str]:
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", path.name).strip("._") or "report"
+    return {"Content-Disposition": f'attachment; filename="{safe_name}"'}
+
+
 def safe_report_path(url_path: str) -> Path:
     rel = unquote(url_path.removeprefix("/reports/"))
     if not rel or rel.startswith("/"):
@@ -682,6 +698,7 @@ def load_report_summary(path: Path) -> dict[str, Any]:
         "size": stat.st_size,
         "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
         "url": public_path(path),
+        "download_url": public_download_path(path),
     }
     if path.suffix.lower() == ".json":
         try:
@@ -707,7 +724,7 @@ def list_reports() -> list[dict[str, Any]]:
         return []
     reports: list[dict[str, Any]] = []
     for path in RESULTS_DIR.glob("*/*"):
-        if path.is_file() and path.suffix.lower() in {".json", ".html", ".pdf"}:
+        if path.is_file() and path.name != "checkpoint.json" and path.suffix.lower() in {".json", ".html", ".pdf"}:
             reports.append(load_report_summary(path))
     return sorted(reports, key=lambda item: item.get("modified", ""), reverse=True)
 
@@ -890,7 +907,7 @@ def run_scan_job(job: ScanJob) -> None:
             job.phase = "Updating scan history"
             job.progress = 96
         try:
-            tracker = StateTracker(str(BASE_DIR / "easm_state.db"))
+            tracker = StateTracker(str(STATE_DB))
             tracker.handle_diffing(job.domain, results)
         except Exception as exc:
             job.log(f"State tracking failed: {exc}")
@@ -1103,7 +1120,9 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._send(404, b"Not found", "text/plain; charset=utf-8")
                 return
             content_type = mimetypes.guess_type(str(report_path))[0] or "application/octet-stream"
-            self._send(200, report_path.read_bytes(), content_type)
+            query = parse_qs(urlsplit(self.path).query)
+            headers = attachment_headers(report_path) if "download" in query else None
+            self._send(200, report_path.read_bytes(), content_type, headers)
             return
         self._send(404, b"Not found", "text/plain; charset=utf-8")
 
@@ -1151,9 +1170,13 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             content_type = mimetypes.guess_type(str(report_path))[0] or "application/octet-stream"
+            query = parse_qs(urlsplit(self.path).query)
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(report_path.stat().st_size))
+            if "download" in query:
+                for key, value in attachment_headers(report_path).items():
+                    self.send_header(key, value)
             self.end_headers()
             return
         self.send_response(404)
@@ -2158,6 +2181,13 @@ APP_HTML = """<!doctype html>
       transition: all .15s ease;
     }
     .link-actions a:hover { background: rgba(140, 160, 210, .14); border-color: rgba(140, 160, 210, .34); }
+    .link-actions .download-button {
+      color: #06131b;
+      background: var(--grad);
+      border-color: transparent;
+    }
+    .link-actions .download-button:hover { filter: brightness(1.06); border-color: transparent; }
+    .report-actions-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 
     /* ---------- Notice ---------- */
     .notice {
@@ -2505,7 +2535,7 @@ APP_HTML = """<!doctype html>
             <strong>${escapeHtml(report.domain)}</strong>
             <span>${escapeHtml(report.file)} · ${escapeHtml(formatDate(report.modified))}</span>
           </div>
-          <div class="link-actions"><a href="${report.url}" target="_blank" rel="noreferrer">PDF</a></div>
+          ${reportLinkActions(report.url, "PDF", report.download_url)}
         </div>
       `).join("") : `<div class="empty">No PDFs generated yet.</div>`;
 
@@ -2515,7 +2545,7 @@ APP_HTML = """<!doctype html>
             <strong>${escapeHtml(report.domain)}</strong>
             <span>${escapeHtml(report.type.toUpperCase())} · risk ${escapeHtml(report.risk_label || "-")} · ${escapeHtml(formatDate(report.modified))}</span>
           </div>
-          <div class="link-actions"><a href="${report.url}" target="_blank" rel="noreferrer">${reportActionLabel(report.url)}</a></div>
+          ${reportLinkActions(report.url, reportActionLabel(report.url), report.download_url)}
         </div>
       `).join("") : `<div class="empty">No reports found.</div>`;
 
@@ -2572,7 +2602,7 @@ APP_HTML = """<!doctype html>
         return;
       }
       $("jobs").innerHTML = jobs.map((job) => {
-        const links = (job.generated_files || []).map((url) => `<a href="${url}" target="_blank" rel="noreferrer">${reportActionLabel(url)}</a>`).join(" ");
+        const links = (job.generated_files || []).map((url) => reportLinkActions(url, reportActionLabel(url))).join(" ");
         const logs = (job.logs || []).slice(-18).map(escapeHtml).join("\\n");
         const chips = [
           `<span class="chip">by ${escapeHtml(job.created_by || "local")}</span>`,
@@ -2588,7 +2618,7 @@ APP_HTML = """<!doctype html>
               <div class="job-meta">${escapeHtml(job.phase || "")} &middot; modules ${escapeHtml((job.modules || []).join(", "))}</div>
               <div class="chip-row">${chips}</div>
               ${job.error ? `<div class="job-meta" style="color: var(--red); font-weight: 800">${escapeHtml(job.error)}</div>` : ""}
-              ${links ? `<div class="link-actions" style="margin-top:8px">${links}</div>` : ""}
+              ${links ? `<div class="report-actions-list">${links}</div>` : ""}
             </div>
             <span class="status ${escapeHtml(job.status)}">${escapeHtml(job.status)}</span>
           </div>
@@ -2612,11 +2642,11 @@ APP_HTML = """<!doctype html>
           <td><span class="risk ${escapeHtml(risk)}">${escapeHtml(risk)}</span></td>
           <td>${escapeHtml(report.findings ?? "-")}</td>
           <td>${escapeHtml(when)}</td>
-          <td><div class="link-actions"><a href="${report.url}" target="_blank" rel="noreferrer">${action}</a></div></td>
+          <td>${reportLinkActions(report.url, action, report.download_url)}</td>
         </tr>`;
       }).join("");
       $("reports").innerHTML = `<table class="reports">
-        <thead><tr><th>Target</th><th>Risk</th><th>Findings</th><th>Date</th><th>Open</th></tr></thead>
+        <thead><tr><th>Target</th><th>Risk</th><th>Findings</th><th>Date</th><th>Actions</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
     }
@@ -2625,6 +2655,21 @@ APP_HTML = """<!doctype html>
       if (String(url).endsWith(".html")) return "HTML";
       if (String(url).endsWith(".pdf")) return "PDF";
       return "JSON";
+    }
+
+    function downloadUrl(url) {
+      const separator = String(url).includes("?") ? "&" : "?";
+      return `${url}${separator}download=1`;
+    }
+
+    function reportLinkActions(url, label, explicitDownloadUrl) {
+      const safeUrl = escapeHtml(url || "#");
+      const safeDownloadUrl = escapeHtml(explicitDownloadUrl || downloadUrl(url || "#"));
+      const safeLabel = escapeHtml(label || "Open");
+      return `<div class="link-actions">
+        <a href="${safeUrl}" target="_blank" rel="noreferrer">${safeLabel}</a>
+        <a class="download-button" href="${safeDownloadUrl}" download>Download</a>
+      </div>`;
     }
 
     function renderAdminRoles() {
@@ -2936,7 +2981,11 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args()
 
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_DB.parent.mkdir(parents=True, exist_ok=True)
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
     explicit_port = args.port is not None or "EASM_WEB_PORT" in os.environ
     port = args.port if args.port is not None else DEFAULT_WEB_PORT
 

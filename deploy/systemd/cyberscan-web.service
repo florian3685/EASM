@@ -1,0 +1,22 @@
+[Unit]
+Description=link-ed.it CyberScan web console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cyberscan
+Group=cyberscan
+WorkingDirectory=/opt/cyberscan
+EnvironmentFile=-/etc/cyberscan/cyberscan.env
+ExecStart=/opt/cyberscan/.venv/bin/python /opt/cyberscan/web_app.py --host ${EASM_WEB_HOST} --port ${EASM_WEB_PORT}
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/cyberscan /etc/cyberscan /opt/cyberscan
+
+[Install]
+WantedBy=multi-user.target

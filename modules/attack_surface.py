@@ -11,6 +11,7 @@ import socket
 import subprocess
 import tempfile
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import dns.resolver
@@ -142,7 +143,7 @@ def _classify_host_roles(hostname: str, ip: str, mx_hosts: set, ns_hosts: set) -
 #  Offene Zugänge (Port-Scanning)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_open_ports(hosts: list[dict]) -> list[dict]:
+def scan_open_ports(hosts: list[dict], on_host_done=None) -> list[dict]:
     """
     Port-Scanning aller identifizierten Hosts.
     Versucht Masscan (als Root), sonst Nmap, sonst TCP-Connect.
@@ -150,7 +151,8 @@ def scan_open_ports(hosts: list[dict]) -> list[dict]:
     print_progress("Attack Surface", "Port-Scanning gestartet …")
     results = []
 
-    for host in hosts:
+    total_hosts = len(hosts)
+    for index, host in enumerate(hosts, start=1):
         ip = host["ip"]
         hostname = host.get("hostname", ip)
         host_result = {
@@ -175,6 +177,8 @@ def scan_open_ports(hosts: list[dict]) -> list[dict]:
         if host_result["open_ports"]:
             log.info(f"  {hostname} ({ip}): {len(host_result['open_ports'])} offene Ports")
         results.append(host_result)
+        if on_host_done:
+            on_host_done(results[:], index, total_hosts, host_result)
 
     return results
 
@@ -255,15 +259,17 @@ def _nmap_scan(ip: str) -> list[dict] | None:
 
 def _tcp_connect_scan(ip: str) -> list[dict]:
     """Einfacher TCP-Connect-Scan als Fallback."""
-    open_ports = []
-    for port in config.ALL_PORTS:
+    timeout = float(os.environ.get("EASM_TCP_CONNECT_TIMEOUT", "1.5"))
+    workers = max(1, int(os.environ.get("EASM_TCP_SCAN_WORKERS", "32")))
+
+    def check_port(port: int) -> dict | None:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(config.TIMEOUT)
+            sock.settimeout(timeout)
             result = sock.connect_ex((ip, port))
             if result == 0:
                 banner = _grab_banner(sock, ip, port)
-                open_ports.append({
+                return {
                     "port": port,
                     "protocol": "tcp",
                     "state": "open",
@@ -273,11 +279,26 @@ def _tcp_connect_scan(ip: str) -> list[dict]:
                     "extra_info": "",
                     "cpe": "",
                     "category": _categorize_port(port),
-                })
+                }
             sock.close()
         except Exception:
-            pass
-    return open_ports
+            return None
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        return None
+
+    open_ports = []
+    max_workers = min(workers, len(config.ALL_PORTS))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(check_port, port) for port in config.ALL_PORTS]
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                open_ports.append(result)
+    return sorted(open_ports, key=lambda item: item["port"])
 
 
 def _grab_banner(sock: socket.socket, ip: str, port: int) -> dict:
@@ -842,35 +863,58 @@ def check_cloud_leaks(domain: str, subdomains: list[str]) -> list[dict]:
 #  Hauptfunktion Modul 1
 # ═════════════════════════════════════════════════════════════════════════════
 
-def run(domain: str) -> dict:
+def run(domain: str, on_progress=None) -> dict:
     """Führt alle Scans des Moduls 'Angriffsoberfläche' aus."""
     result = {}
 
     # 1. Host-Discovery
     host_discovery = discover_hosts(domain)
     result["host_discovery"] = host_discovery
+    if on_progress:
+        on_progress(result.copy(), f"host discovery: {len(host_discovery.get('hosts', []))} host(s)")
 
     # 2. Offene Zugänge
-    port_results = scan_open_ports(host_discovery["hosts"])
+    port_results = []
+
+    def _port_progress(partial_ports, done, total, _host_result):
+        result["open_ports"] = partial_ports
+        if on_progress:
+            on_progress(result.copy(), f"port scan: {done}/{total} host(s)")
+
+    port_results = scan_open_ports(host_discovery["hosts"], on_host_done=_port_progress)
     result["open_ports"] = port_results
+    if on_progress:
+        on_progress(result.copy(), f"port scan complete: {len(port_results)} host result(s)")
 
     # 3. Software-Erkennung
     software = detect_software(domain, host_discovery["hosts"], port_results)
     result["software"] = software
+    if on_progress:
+        on_progress(result.copy(), f"software fingerprinting: {len(software)} finding(s)")
 
     # 4. CVE-Abgleich
     result["cves"] = check_cves(software)
+    if on_progress:
+        on_progress(result.copy(), f"cve check: {len(result['cves'])} finding(s)")
 
     # 5. Login-Portale
     result["login_portals"] = find_login_portals(domain)
+    if on_progress:
+        on_progress(result.copy(), f"login portal check: {len(result['login_portals'])} portal(s)")
 
     # 6. Malicious Traffic
     result["malicious_traffic"] = check_malicious_traffic(host_discovery["hosts"])
+    if on_progress:
+        on_progress(result.copy(), "reputation check complete")
 
     # 7. Active Vulnerability Scanning (Nuclei)
     result["active_vulnerabilities"] = active_vulnerability_scan(domain, host_discovery["hosts"])
+    if on_progress:
+        on_progress(result.copy(), f"active vulnerability scan: {len(result['active_vulnerabilities'])} finding(s)")
 
     # 8. Cloud Leaks
     result["cloud_leaks"] = check_cloud_leaks(domain, host_discovery["subdomains"])
+    if on_progress:
+        on_progress(result.copy(), f"cloud leak check: {len(result['cloud_leaks'])} finding(s)")
 
     return result

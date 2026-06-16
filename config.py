@@ -8,8 +8,12 @@ API-Keys werden bevorzugt aus Umgebungsvariablen gelesen.
 import os
 try:
     from dotenv import load_dotenv
-    # Finde die .env Datei im gleichen Ordner wie config.py
-    dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+    base_dir = os.path.dirname(__file__)
+    data_dir = os.environ.get("EASM_DATA_DIR", "")
+    dotenv_path = (
+        os.environ.get("EASM_ENV_FILE")
+        or (os.path.join(data_dir, ".env") if data_dir else os.path.join(base_dir, ".env"))
+    )
     load_dotenv(dotenv_path)
 except ImportError:
     pass
