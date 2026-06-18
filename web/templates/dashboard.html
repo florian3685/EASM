@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dashboard · link-ed.it CyberScan</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script defer src="/static/js/common.js"></script>
+  <script defer src="/static/js/dashboard.js"></script>
+</head>
+<body data-page="dashboard">
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="/dashboard">
+        <span class="brand-logo-wrap"><img class="brand-logo" src="/static/img/link-ed.it-logo.png" alt="link-ed.it Consulting & Services"></span>
+        <span><span class="brand-title">CyberScan</span><span class="brand-subtitle">Security operations console</span></span>
+      </a>
+      <nav class="primary-nav" aria-label="Main navigation">
+        <a href="/dashboard" data-route-link="dashboard"><i data-lucide="layout-dashboard"></i>Dashboard</a>
+        <a href="/scans" data-route-link="scans"><i data-lucide="radar"></i>Scans</a>
+        <a href="/reports" data-route-link="reports"><i data-lucide="file-text"></i>Reports</a>
+        <a href="/admin/users" data-route-link="admin-users" data-admin-only="true"><i data-lucide="users"></i>Users</a>
+      </nav>
+      <div class="top-actions">
+        <button class="icon-button" type="button" data-command-open title="Command palette" aria-label="Command palette"><i data-lucide="search"></i></button>
+        <button class="theme-toggle" type="button" data-theme-toggle aria-label="Toggle theme"></button>
+        <div class="userbox"><span id="userLabel">local</span><a class="logout" href="/logout"><i data-lucide="log-out"></i>Logout</a></div>
+      </div>
+    </header>
+
+    <main class="page">
+      <div class="page-head">
+        <div>
+          <p class="eyebrow">Overview</p>
+          <h1 class="page-title">Command center</h1>
+          <p class="page-copy">Live scan activity, schedule backlog, generated reports and the latest risk signals.</p>
+        </div>
+      </div>
+
+      <section id="metrics" class="metrics" aria-label="Operational metrics"></section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>Operations Overview</h2></div>
+        <div class="panel-body">
+          <div id="dashboardContent"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

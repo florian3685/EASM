@@ -22,22 +22,24 @@ import errno
 import hashlib
 import html
 import hmac
+import io
 import json
 import mimetypes
 import os
 import re
 import secrets
 import socket
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import config
 from checkpoint import Checkpoint
@@ -48,6 +50,9 @@ from state_manager import StateTracker
 
 
 BASE_DIR = Path(__file__).resolve().parent
+VENDOR_DIR = BASE_DIR / "vendor"
+if VENDOR_DIR.is_dir() and str(VENDOR_DIR) not in sys.path:
+    sys.path.insert(0, str(VENDOR_DIR))
 DATA_DIR = Path(os.environ.get("EASM_DATA_DIR", str(BASE_DIR))).resolve()
 RESULTS_DIR = Path(os.environ.get("EASM_RESULTS_DIR", str(DATA_DIR / "results"))).resolve()
 APP_TITLE = "link-ed.it CyberScan"
@@ -55,10 +60,14 @@ APP_TAGLINE = "Internal customer-domain security scans"
 COMPANY_NAME = "link-ed.it"
 USERS_FILE = Path(os.environ.get("EASM_WEB_USERS_FILE", str(DATA_DIR / "web_users.json"))).resolve()
 STATE_DB = Path(os.environ.get("EASM_STATE_DB", str(DATA_DIR / "easm_state.db"))).resolve()
+SCHEDULE_FILE = Path(os.environ.get("EASM_SCAN_SCHEDULE_FILE", str(DATA_DIR / "scan_schedule.json"))).resolve()
 WEB_TOKEN = os.environ.get("EASM_WEB_TOKEN", "").strip()
 WEB_USERS_RAW = os.environ.get("EASM_WEB_USERS", "").strip()
 SESSION_COOKIE = "easm_session"
+TRUSTED_2FA_COOKIE = "easm_trusted_2fa"
 SESSION_TTL_SECONDS = int(os.environ.get("EASM_WEB_SESSION_SECONDS", "43200"))
+TWO_FACTOR_CHALLENGE_SECONDS = int(os.environ.get("EASM_2FA_CHALLENGE_SECONDS", "600"))
+TRUSTED_2FA_SECONDS = int(os.environ.get("EASM_TRUSTED_2FA_SECONDS", str(30 * 24 * 60 * 60)))
 SESSION_SECRET = (
     os.environ.get("EASM_WEB_SESSION_SECRET")
     or WEB_TOKEN
@@ -66,6 +75,7 @@ SESSION_SECRET = (
 ).encode("utf-8")
 DEFAULT_WEB_PORT = int(os.environ.get("EASM_WEB_PORT", "18080"))
 MAX_WORKERS = int(os.environ.get("EASM_WEB_MAX_WORKERS", "1"))
+SCHEDULE_POLL_SECONDS = int(os.environ.get("EASM_SCHEDULE_POLL_SECONDS", "300"))
 USER_ROLES = [
     {"id": "admin", "label": "Admin"},
     {"id": "scanner", "label": "Scanner"},
@@ -73,6 +83,8 @@ USER_ROLES = [
 ]
 ROLE_IDS = {role["id"] for role in USER_ROLES}
 USER_LOCK = threading.RLock()
+SCHEDULE_LOCK = threading.RLock()
+SCHEDULER_STOP = threading.Event()
 ENV_FILE = Path(
     os.environ.get(
         "EASM_ENV_FILE",
@@ -225,6 +237,349 @@ def parse_modules(raw_modules: Any) -> list[int]:
     if invalid:
         raise ValueError(f"Invalid module selection: {invalid}")
     return modules
+
+
+def parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def profile_by_id(profile_id: str) -> dict[str, Any] | None:
+    for profile in PROFILES:
+        if profile["id"] == profile_id:
+            return profile
+    return None
+
+
+def parse_cadence_days(value: Any) -> int:
+    try:
+        days = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Schedule cadence must be a number of days.") from exc
+    if days < 1 or days > 365:
+        raise ValueError("Schedule cadence must be between 1 and 365 days.")
+    return days
+
+
+def parse_schedule_date(value: Any) -> date:
+    if not value:
+        return datetime.now(timezone.utc).date()
+    text = str(value).strip()
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError as exc:
+        raise ValueError("Next scan date must use YYYY-MM-DD.") from exc
+
+
+def normalize_schedule_payload(
+    payload: dict[str, Any],
+    username: str,
+    existing: dict[str, Any] | None = None,
+    touch: bool = True,
+) -> dict[str, Any]:
+    existing = existing or {}
+    domain = validate_domain(str(payload.get("domain", existing.get("domain", ""))))
+    profile_id = str(payload.get("profile", existing.get("profile", "full_recon")) or "full_recon").strip()
+    profile = profile_by_id(profile_id)
+    if not profile:
+        raise ValueError("Unknown scan profile.")
+
+    modules_raw = payload.get("modules", existing.get("modules", profile["modules"]))
+    modules = parse_modules(modules_raw)
+    exploit = parse_bool(payload.get("exploit", existing.get("exploit", profile.get("exploit", False))))
+    if exploit and 11 not in modules:
+        modules = sorted(set(modules + [11]))
+    if 11 in modules and not exploit:
+        raise ValueError("Module 11 schedules require exploit mode.")
+
+    active = parse_bool(payload.get("active", existing.get("active", True)), True)
+    authorized = parse_bool(payload.get("authorized", existing.get("authorized", False)))
+    if active and not authorized:
+        raise ValueError("Confirm customer authorization before saving an active schedule.")
+
+    cadence_raw = payload.get("cadence_days", payload.get("cadence", existing.get("cadence_days", 30)))
+    next_raw = payload.get("next_scan", existing.get("next_scan", datetime.now(timezone.utc).date().isoformat()))
+    created_at = str(existing.get("created_at") or utc_now())
+    created_by = str(existing.get("created_by") or username)
+
+    return {
+        "id": str(payload.get("id", existing.get("id") or secrets.token_hex(6))),
+        "domain": domain,
+        "profile": profile_id,
+        "profile_name": profile["name"],
+        "modules": modules,
+        "stealth": parse_bool(payload.get("stealth", existing.get("stealth", True)), True),
+        "exploit": exploit,
+        "fresh": parse_bool(payload.get("fresh", existing.get("fresh", True)), True),
+        "authorized": authorized,
+        "active": active,
+        "cadence_days": parse_cadence_days(cadence_raw),
+        "next_scan": parse_schedule_date(next_raw).isoformat(),
+        "created_by": created_by,
+        "created_at": created_at,
+        "updated_by": username if touch else str(existing.get("updated_by") or username),
+        "updated_at": utc_now() if touch else str(existing.get("updated_at") or created_at),
+        "last_queued_at": str(payload.get("last_queued_at", existing.get("last_queued_at", "")) or ""),
+    }
+
+
+def _read_schedule_unlocked() -> list[dict[str, Any]]:
+    if not SCHEDULE_FILE.exists():
+        return []
+    try:
+        with SCHEDULE_FILE.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    raw_items = data.get("items", []) if isinstance(data, dict) else data
+    if not isinstance(raw_items, list):
+        return []
+
+    items: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            items.append(normalize_schedule_payload(
+                raw,
+                str(raw.get("updated_by") or raw.get("created_by") or "system"),
+                raw,
+                touch=False,
+            ))
+        except Exception:
+            continue
+    return items
+
+
+def _write_schedule_unlocked(items: list[dict[str, Any]]) -> None:
+    SCHEDULE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = SCHEDULE_FILE.with_suffix(SCHEDULE_FILE.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump({"items": items}, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    tmp_path.replace(SCHEDULE_FILE)
+
+
+def latest_report_by_domain(reports: list[dict[str, Any]]) -> dict[str, str]:
+    latest: dict[str, str] = {}
+    for report in reports:
+        domain = str(report.get("domain", "") or "")
+        stamp = str(report.get("scan_date") or report.get("modified") or "")
+        if not domain or not stamp:
+            continue
+        if stamp > latest.get(domain, ""):
+            latest[domain] = stamp
+    return latest
+
+
+def active_job_status_by_domain(jobs: list[dict[str, Any]]) -> dict[str, str]:
+    status_rank = {"running": 0, "queued": 1}
+    active: dict[str, str] = {}
+    for job in jobs:
+        status = str(job.get("status", "") or "")
+        if status not in status_rank:
+            continue
+        domain = str(job.get("domain", "") or "")
+        if not domain:
+            continue
+        current = active.get(domain)
+        if current is None or status_rank[status] < status_rank[current]:
+            active[domain] = status
+    return active
+
+
+def decorate_schedule_item(
+    item: dict[str, Any],
+    jobs: list[dict[str, Any]],
+    reports: list[dict[str, Any]],
+) -> dict[str, Any]:
+    today = datetime.now(timezone.utc).date()
+    next_date = parse_schedule_date(item.get("next_scan"))
+    days_until = (next_date - today).days
+    active_jobs = active_job_status_by_domain(jobs)
+    latest_reports = latest_report_by_domain(reports)
+    active = bool(item.get("active", True))
+
+    if not active:
+        due_state = "disabled"
+    elif days_until < 0:
+        due_state = "overdue"
+    elif days_until == 0:
+        due_state = "due_today"
+    elif days_until <= 7:
+        due_state = "due_soon"
+    else:
+        due_state = "scheduled"
+
+    domain = str(item.get("domain", ""))
+    active_job = active_jobs.get(domain, "")
+    last_scan_date = latest_reports.get(domain, "")
+    decorated = dict(item)
+    decorated.update({
+        "days_until": days_until,
+        "due_state": due_state,
+        "last_scan_date": last_scan_date,
+        "active_job_status": active_job,
+        "needs_scan": bool(active and not active_job and (days_until <= 0 or not last_scan_date)),
+    })
+    return decorated
+
+
+def list_scan_schedule(
+    jobs: list[dict[str, Any]] | None = None,
+    reports: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    jobs = JOBS.list() if jobs is None else jobs
+    reports = list_reports() if reports is None else reports
+    with SCHEDULE_LOCK:
+        items = _read_schedule_unlocked()
+    decorated = [decorate_schedule_item(item, jobs, reports) for item in items]
+    return sorted(decorated, key=lambda item: (not item.get("active", True), item.get("days_until", 9999), item.get("domain", "")))
+
+
+def scan_overview(
+    schedule: list[dict[str, Any]] | None = None,
+    jobs: list[dict[str, Any]] | None = None,
+    reports: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    jobs = JOBS.list() if jobs is None else jobs
+    reports = list_reports() if reports is None else reports
+    schedule = list_scan_schedule(jobs, reports) if schedule is None else schedule
+    active_items = [item for item in schedule if item.get("active", True)]
+    report_domains = {str(report.get("domain", "")) for report in reports if report.get("domain")}
+    scheduled_domains = {str(item.get("domain", "")) for item in active_items if item.get("domain")}
+    due_items = [item for item in active_items if int(item.get("days_until", 9999)) <= 0]
+    next_due = next((item for item in active_items if int(item.get("days_until", 9999)) >= 0), None)
+
+    return {
+        "running": sum(1 for job in jobs if job.get("status") == "running"),
+        "queued": sum(1 for job in jobs if job.get("status") == "queued"),
+        "scheduled_total": len(schedule),
+        "scheduled_active": len(active_items),
+        "due_now": len(due_items),
+        "overdue": sum(1 for item in active_items if item.get("due_state") == "overdue"),
+        "due_this_week": sum(1 for item in active_items if 0 <= int(item.get("days_until", 9999)) <= 7),
+        "never_scanned": sum(1 for item in active_items if not item.get("last_scan_date")),
+        "needs_scan": sum(1 for item in active_items if item.get("needs_scan")),
+        "coverage_domains": len(scheduled_domains | report_domains),
+        "scheduled_domains": len(scheduled_domains),
+        "reported_domains": len(report_domains),
+        "next_due_domain": next_due.get("domain", "") if next_due else "",
+        "next_due_date": next_due.get("next_scan", "") if next_due else "",
+    }
+
+
+def upsert_scan_schedule(payload: dict[str, Any], username: str) -> dict[str, Any]:
+    with SCHEDULE_LOCK:
+        items = _read_schedule_unlocked()
+        schedule_id = str(payload.get("id", "") or "")
+        existing_index = next((idx for idx, item in enumerate(items) if item.get("id") == schedule_id), None)
+        existing = items[existing_index] if existing_index is not None else None
+        item = normalize_schedule_payload(payload, username, existing)
+        if existing_index is None:
+            items.append(item)
+        else:
+            items[existing_index] = item
+        _write_schedule_unlocked(items)
+    return item
+
+
+def delete_scan_schedule(schedule_id: str) -> bool:
+    with SCHEDULE_LOCK:
+        items = _read_schedule_unlocked()
+        kept = [item for item in items if item.get("id") != schedule_id]
+        if len(kept) == len(items):
+            return False
+        _write_schedule_unlocked(kept)
+        return True
+
+
+def get_scan_schedule(schedule_id: str) -> dict[str, Any] | None:
+    with SCHEDULE_LOCK:
+        for item in _read_schedule_unlocked():
+            if item.get("id") == schedule_id:
+                return item
+    return None
+
+
+def mark_schedule_queued(schedule_id: str, username: str) -> dict[str, Any] | None:
+    with SCHEDULE_LOCK:
+        items = _read_schedule_unlocked()
+        for index, item in enumerate(items):
+            if item.get("id") != schedule_id:
+                continue
+            next_date = datetime.now(timezone.utc).date() + timedelta(days=int(item.get("cadence_days", 30)))
+            updated = dict(item)
+            updated.update({
+                "next_scan": next_date.isoformat(),
+                "last_queued_at": utc_now(),
+                "updated_by": username,
+                "updated_at": utc_now(),
+            })
+            items[index] = updated
+            _write_schedule_unlocked(items)
+            return updated
+    return None
+
+
+def queue_schedule_job(item: dict[str, Any], username: str, source: str = "schedule") -> ScanJob:
+    if not item.get("authorized"):
+        raise ValueError("Customer authorization is required before this scheduled scan can run.")
+    if 11 in item.get("modules", []) and not item.get("exploit"):
+        raise ValueError("Module 11 schedules require exploit mode.")
+    job = JOBS.create(
+        str(item["domain"]),
+        list(item["modules"]),
+        bool(item.get("stealth", True)),
+        bool(item.get("exploit", False)),
+        bool(item.get("fresh", True)),
+        True,
+        username,
+    )
+    job.log(f"Queued from {source} by {username}.")
+    EXECUTOR.submit(run_scan_job, job)
+    mark_schedule_queued(str(item["id"]), username)
+    return job
+
+
+def run_due_schedules_once() -> int:
+    jobs = JOBS.list()
+    reports = list_reports()
+    schedule = list_scan_schedule(jobs, reports)
+    queued = 0
+    for item in schedule:
+        if not item.get("active", True):
+            continue
+        if int(item.get("days_until", 9999)) > 0:
+            continue
+        if item.get("active_job_status"):
+            continue
+        if not item.get("authorized"):
+            continue
+        try:
+            queue_schedule_job(item, "scheduler", "automatic schedule")
+            queued += 1
+        except Exception as exc:
+            print(f"[scheduler] Could not queue {item.get('domain', '-')}: {exc}")
+    return queued
+
+
+def schedule_loop() -> None:
+    while not SCHEDULER_STOP.is_set():
+        try:
+            queued = run_due_schedules_once()
+            if queued:
+                print(f"[scheduler] Queued {queued} due scheduled scan(s).")
+        except Exception as exc:
+            print(f"[scheduler] Schedule poll failed: {exc}")
+        SCHEDULER_STOP.wait(max(30, SCHEDULE_POLL_SECONDS))
 
 
 def mask_secret(value: str) -> str:
@@ -401,6 +756,81 @@ def password_matches(stored: str, supplied: str) -> bool:
     return secrets.compare_digest(stored, supplied)
 
 
+def generate_totp_secret() -> str:
+    return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+
+
+def format_totp_secret(secret: str) -> str:
+    clean = re.sub(r"[^A-Z2-7]", "", (secret or "").upper())
+    return " ".join(clean[index:index + 4] for index in range(0, len(clean), 4))
+
+
+def decode_totp_secret(secret: str) -> bytes:
+    clean = re.sub(r"[^A-Z2-7]", "", (secret or "").upper())
+    if not clean:
+        raise ValueError("Missing authenticator secret.")
+    return base64.b32decode(clean + "=" * (-len(clean) % 8), casefold=True)
+
+
+def totp_code(secret: str, counter: int, digits: int = 6) -> str:
+    key = decode_totp_secret(secret)
+    msg = counter.to_bytes(8, "big")
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = int.from_bytes(digest[offset:offset + 4], "big") & 0x7FFFFFFF
+    return str(value % (10 ** digits)).zfill(digits)
+
+
+def verify_totp_code(secret: str, code: str, window: int = 1) -> bool:
+    clean = re.sub(r"\D", "", code or "")
+    if len(clean) != 6:
+        return False
+    counter = int(time.time() // 30)
+    for drift in range(-window, window + 1):
+        try:
+            expected = totp_code(secret, counter + drift)
+        except Exception:
+            return False
+        if secrets.compare_digest(expected, clean):
+            return True
+    return False
+
+
+def two_factor_enabled(user: dict[str, Any] | None) -> bool:
+    return bool(user and user.get("totp_enabled") and user.get("totp_secret"))
+
+
+def two_factor_required_for_user(username: str) -> bool:
+    return bool(has_managed_users() and get_managed_user(username))
+
+
+def totp_fingerprint(user: dict[str, Any]) -> str:
+    secret = str(user.get("totp_secret", "") or "")
+    reset = str(user.get("totp_reset_at", "") or "")
+    return hashlib.sha256(f"{secret}:{reset}".encode("utf-8")).hexdigest()[:24]
+
+
+def otpauth_uri(username: str, secret: str) -> str:
+    issuer = APP_TITLE
+    label = f"{COMPANY_NAME}:{username}"
+    return (
+        f"otpauth://totp/{quote(label)}"
+        f"?secret={quote(secret)}&issuer={quote(issuer)}&algorithm=SHA1&digits=6&period=30"
+    )
+
+
+def qr_data_uri(value: str) -> str:
+    try:
+        import qrcode
+        from qrcode.image.svg import SvgPathImage
+    except Exception:
+        return ""
+    image = qrcode.make(value, image_factory=SvgPathImage)
+    buffer = io.BytesIO()
+    image.save(buffer)
+    return "data:image/svg+xml;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
 def _empty_user_store() -> dict[str, Any]:
     return {"users": {}}
 
@@ -469,6 +899,8 @@ def sanitize_user(username: str, user: dict[str, Any]) -> dict[str, Any]:
         "username": username,
         "role": normalize_role(str(user.get("role", "scanner"))),
         "active": bool(user.get("active", True)),
+        "two_factor_enabled": two_factor_enabled(user),
+        "two_factor_pending": bool(user.get("totp_pending_secret")),
         "created_at": user.get("created_at", ""),
         "updated_at": user.get("updated_at", ""),
         "source": user.get("source", "local"),
@@ -530,6 +962,17 @@ def upsert_managed_user(
         "updated_by": updated_by,
         "source": "local",
     }
+    if existing:
+        for key in (
+            "totp_enabled",
+            "totp_secret",
+            "totp_created_at",
+            "totp_pending_secret",
+            "totp_pending_at",
+            "totp_reset_at",
+        ):
+            if key in existing:
+                record[key] = existing[key]
     if password:
         record["password"] = hash_password(password)
 
@@ -538,6 +981,77 @@ def upsert_managed_user(
         raise ValueError("At least one active admin user is required.")
     save_user_store(data)
     return sanitize_user(username, record)
+
+
+def reset_user_two_factor(username: str, updated_by: str) -> dict[str, Any]:
+    username = (username or "").strip()
+    data = load_user_store()
+    users = data.get("users", {})
+    user = users.get(username)
+    if not isinstance(user, dict):
+        raise ValueError("User not found.")
+    for key in ("totp_enabled", "totp_secret", "totp_created_at", "totp_pending_secret", "totp_pending_at"):
+        user.pop(key, None)
+    user["totp_reset_at"] = utc_now()
+    user["updated_at"] = utc_now()
+    user["updated_by"] = updated_by
+    save_user_store(data)
+    return sanitize_user(username, user)
+
+
+def begin_two_factor_enrollment(username: str) -> dict[str, Any]:
+    username = (username or "").strip()
+    data = load_user_store()
+    users = data.get("users", {})
+    user = users.get(username)
+    if not isinstance(user, dict) or not user.get("active", True):
+        raise ValueError("User not found.")
+    if two_factor_enabled(user):
+        secret = str(user["totp_secret"])
+    else:
+        secret = str(user.get("totp_pending_secret") or generate_totp_secret())
+        user["totp_pending_secret"] = secret
+        user["totp_pending_at"] = utc_now()
+        save_user_store(data)
+    uri = otpauth_uri(username, secret)
+    return {
+        "purpose": "enroll",
+        "username": username,
+        "challenge": sign_two_factor_challenge(username, "enroll"),
+        "secret": secret,
+        "formatted_secret": format_totp_secret(secret),
+        "otpauth_uri": uri,
+        "qr_data_uri": qr_data_uri(uri),
+    }
+
+
+def two_factor_verify_context(username: str) -> dict[str, Any]:
+    return {
+        "purpose": "verify",
+        "username": username,
+        "challenge": sign_two_factor_challenge(username, "verify"),
+    }
+
+
+def confirm_two_factor_enrollment(username: str, code: str) -> dict[str, Any]:
+    username = (username or "").strip()
+    data = load_user_store()
+    users = data.get("users", {})
+    user = users.get(username)
+    if not isinstance(user, dict) or not user.get("active", True):
+        raise ValueError("User not found.")
+    secret = str(user.get("totp_pending_secret") or user.get("totp_secret") or "")
+    if not verify_totp_code(secret, code):
+        raise ValueError("Invalid authenticator code.")
+    user["totp_enabled"] = True
+    user["totp_secret"] = secret
+    user["totp_created_at"] = utc_now()
+    user.pop("totp_pending_secret", None)
+    user.pop("totp_pending_at", None)
+    user["updated_at"] = utc_now()
+    user["updated_by"] = username
+    save_user_store(data)
+    return user
 
 
 def delete_managed_user(username: str) -> None:
@@ -634,17 +1148,13 @@ def b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode((value + padding).encode("ascii"))
 
 
-def sign_session(username: str) -> str:
-    payload = {
-        "user": username,
-        "exp": int(time.time()) + SESSION_TTL_SECONDS,
-    }
+def sign_token(payload: dict[str, Any]) -> str:
     payload_b64 = b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     sig = hmac.new(SESSION_SECRET, payload_b64.encode("ascii"), hashlib.sha256).digest()
     return f"{payload_b64}.{b64url(sig)}"
 
 
-def verify_session(value: str) -> str | None:
+def verify_signed_token(value: str, expected_type: str) -> dict[str, Any] | None:
     if not value or "." not in value:
         return None
     payload_b64, sig_b64 = value.rsplit(".", 1)
@@ -655,10 +1165,96 @@ def verify_session(value: str) -> str | None:
         payload = json.loads(b64url_decode(payload_b64).decode("utf-8"))
     except (ValueError, json.JSONDecodeError):
         return None
+    if payload.get("typ") != expected_type:
+        return None
     if int(payload.get("exp", 0)) < int(time.time()):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def sign_session(username: str) -> str:
+    payload = {
+        "typ": "session",
+        "user": username,
+        "exp": int(time.time()) + SESSION_TTL_SECONDS,
+    }
+    return sign_token(payload)
+
+
+def verify_session(value: str) -> str | None:
+    payload = verify_signed_token(value, "session")
+    if not payload:
         return None
     username = str(payload.get("user", "")).strip()
     return username or None
+
+
+def sign_two_factor_challenge(username: str, purpose: str) -> str:
+    return sign_token({
+        "typ": "2fa_challenge",
+        "user": username,
+        "purpose": purpose,
+        "nonce": secrets.token_hex(8),
+        "exp": int(time.time()) + TWO_FACTOR_CHALLENGE_SECONDS,
+    })
+
+
+def verify_two_factor_challenge(value: str) -> dict[str, Any] | None:
+    payload = verify_signed_token(value, "2fa_challenge")
+    if not payload:
+        return None
+    username = str(payload.get("user", "")).strip()
+    purpose = str(payload.get("purpose", "")).strip()
+    if not username or purpose not in {"enroll", "verify"}:
+        return None
+    return payload
+
+
+def sign_trusted_device(username: str, user: dict[str, Any]) -> str:
+    return sign_token({
+        "typ": "trusted_2fa",
+        "user": username,
+        "fp": totp_fingerprint(user),
+        "exp": int(time.time()) + TRUSTED_2FA_SECONDS,
+    })
+
+
+def verify_trusted_device(value: str, username: str, user: dict[str, Any]) -> bool:
+    payload = verify_signed_token(value, "trusted_2fa")
+    if not payload:
+        return False
+    if str(payload.get("user", "")) != username:
+        return False
+    return secrets.compare_digest(str(payload.get("fp", "")), totp_fingerprint(user))
+
+
+def cookie_header(name: str, value: str, max_age: int, http_only: bool = True) -> str:
+    parts = [f"{name}={value}", f"Max-Age={max_age}", "SameSite=Lax", "Path=/"]
+    if http_only:
+        parts.insert(2, "HttpOnly")
+    return "; ".join(parts)
+
+
+def session_cookie_header(username: str) -> str:
+    return cookie_header(SESSION_COOKIE, sign_session(username), SESSION_TTL_SECONDS)
+
+
+def clear_cookie_header(name: str) -> str:
+    return cookie_header(name, "", 0)
+
+
+def login_headers(username: str, trust_device: bool = False, user: dict[str, Any] | None = None) -> list[tuple[str, str]]:
+    headers = [
+        ("Set-Cookie", session_cookie_header(username)),
+        ("Location", "/dashboard"),
+    ]
+    if trust_device and user and two_factor_enabled(user):
+        headers.insert(1, ("Set-Cookie", cookie_header(
+            TRUSTED_2FA_COOKIE,
+            sign_trusted_device(username, user),
+            TRUSTED_2FA_SECONDS,
+        )))
+    return headers
 
 
 def public_path(path: Path) -> str:
@@ -932,6 +1528,9 @@ def run_scan_job(job: ScanJob) -> None:
 
 
 def app_bootstrap(username: str) -> dict[str, Any]:
+    jobs = JOBS.list()
+    reports = list_reports()
+    schedule = list_scan_schedule(jobs, reports)
     modules = [
         {
             "id": module_id,
@@ -965,8 +1564,10 @@ def app_bootstrap(username: str) -> dict[str, Any]:
         "users": list_managed_users() if is_admin_user(username) else [],
         "api_key_status": list_api_key_status() if is_admin_user(username) else [],
         "max_workers": max(1, MAX_WORKERS),
-        "jobs": JOBS.list(),
-        "reports": list_reports(),
+        "jobs": jobs,
+        "reports": reports,
+        "schedule": schedule,
+        "scan_overview": scan_overview(schedule, jobs, reports),
     }
 
 
@@ -977,13 +1578,14 @@ class WebHandler(BaseHTTPRequestHandler):
         print(f"[web] {self.address_string()} - {fmt % args}")
 
     def _send(self, status: int, body: bytes, content_type: str = "text/html; charset=utf-8",
-              headers: dict[str, str] | None = None) -> None:
+              headers: dict[str, str] | list[tuple[str, str]] | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         if headers:
-            for key, value in headers.items():
+            header_items = headers.items() if isinstance(headers, dict) else headers
+            for key, value in header_items:
                 self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
@@ -1002,23 +1604,27 @@ class WebHandler(BaseHTTPRequestHandler):
             return {}
         return json.loads(raw.decode("utf-8"))
 
+    def _cookie_value(self, name: str) -> str:
+        jar = cookies.SimpleCookie(self.headers.get("Cookie", ""))
+        morsel = jar.get(name)
+        return morsel.value if morsel else ""
+
     def _current_user(self) -> str | None:
         if not auth_required():
             return "local"
-        jar = cookies.SimpleCookie(self.headers.get("Cookie", ""))
-        morsel = jar.get(SESSION_COOKIE)
-        if morsel:
-            username = verify_session(morsel.value)
+        session_value = self._cookie_value(SESSION_COOKIE)
+        if session_value:
+            username = verify_session(session_value)
             if username:
                 if has_managed_users():
                     managed = get_managed_user(username)
-                    if managed and managed.get("active", True):
+                    if managed and managed.get("active", True) and two_factor_enabled(managed):
                         return username
                 elif username in WEB_USERS or not WEB_USERS:
                     return username
 
-        legacy = jar.get("easm_token")
-        if legacy and WEB_TOKEN and secrets.compare_digest(legacy.value, WEB_TOKEN):
+        legacy = self._cookie_value("easm_token")
+        if legacy and WEB_TOKEN and secrets.compare_digest(legacy, WEB_TOKEN):
             return "team"
         return None
 
@@ -1055,6 +1661,15 @@ class WebHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
+        if path.startswith("/static/"):
+            try:
+                asset_path = safe_static_path(path)
+            except FileNotFoundError:
+                self._send(404, b"Not found", "text/plain; charset=utf-8")
+                return
+            content_type = mimetypes.guess_type(str(asset_path))[0] or "application/octet-stream"
+            self._send(200, asset_path.read_bytes(), content_type)
+            return
         if path == "/setup":
             if setup_required():
                 self._send(200, render_setup().encode("utf-8"))
@@ -1069,10 +1684,10 @@ class WebHandler(BaseHTTPRequestHandler):
                 303,
                 b"",
                 "text/plain; charset=utf-8",
-                {
-                    "Set-Cookie": f"{SESSION_COOKIE}=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/",
-                    "Location": "/login",
-                },
+                [
+                    ("Set-Cookie", clear_cookie_header(SESSION_COOKIE)),
+                    ("Location", "/login"),
+                ],
             )
             return
         if not self._require_auth():
@@ -1083,14 +1698,23 @@ class WebHandler(BaseHTTPRequestHandler):
         if path == "/admin":
             self._send(303, b"", "text/plain; charset=utf-8", {"Location": "/admin/users"})
             return
-        if path in {"/dashboard", "/scans", "/reports", "/admin/users", "/admin/api-keys", "/index.html"}:
-            self._send(200, APP_HTML.encode("utf-8"))
+        if path in {"/admin/users", "/admin/api-keys"} and not is_admin_user(self._current_user() or ""):
+            self._send(303, b"", "text/plain; charset=utf-8", {"Location": "/dashboard"})
+            return
+        if path in APP_ROUTES:
+            self._send(200, render_app_page(path).encode("utf-8"))
             return
         if path == "/api/bootstrap":
             self._json(200, app_bootstrap(self._current_user() or "local"))
             return
         if path == "/api/scans":
             self._json(200, {"jobs": JOBS.list()})
+            return
+        if path == "/api/schedule":
+            jobs = JOBS.list()
+            reports = list_reports()
+            schedule = list_scan_schedule(jobs, reports)
+            self._json(200, {"schedule": schedule, "overview": scan_overview(schedule, jobs, reports)})
             return
         if path.startswith("/api/scans/"):
             job_id = path.rsplit("/", 1)[-1]
@@ -1128,6 +1752,40 @@ class WebHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:
         path = urlsplit(self.path).path
+        if path.startswith("/static/"):
+            try:
+                asset_path = safe_static_path(path)
+            except FileNotFoundError:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            content_type = mimetypes.guess_type(str(asset_path))[0] or "application/octet-stream"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(asset_path.stat().st_size))
+            self.end_headers()
+            return
+        if path == "/setup":
+            if setup_required():
+                body = render_setup().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+            else:
+                self.send_response(303)
+                self.send_header("Location", "/login")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            return
+        if path == "/login":
+            body = (render_setup() if setup_required() else render_login()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            return
         if setup_required() and path != "/setup":
             body = b"Initial admin setup required."
             self.send_response(428)
@@ -1154,8 +1812,14 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if path in {"/", "/dashboard", "/scans", "/reports", "/admin/users", "/admin/api-keys", "/index.html"}:
-            body = APP_HTML.encode("utf-8")
+        if path in {"/admin/users", "/admin/api-keys"} and not is_admin_user(self._current_user() or ""):
+            self.send_response(303)
+            self.send_header("Location", "/dashboard")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path in APP_ROUTES:
+            body = render_app_page(path).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1199,18 +1863,10 @@ class WebHandler(BaseHTTPRequestHandler):
                 return
             try:
                 upsert_managed_user(username, password, "admin", True, "setup")
-                session = sign_session(username)
+                two_factor = begin_two_factor_enrollment(username)
                 self._send(
-                    303,
-                    b"",
-                    "text/plain; charset=utf-8",
-                    {
-                        "Set-Cookie": (
-                            f"{SESSION_COOKIE}={session}; Max-Age={SESSION_TTL_SECONDS}; "
-                            "HttpOnly; SameSite=Lax; Path=/"
-                        ),
-                        "Location": "/dashboard",
-                    },
+                    200,
+                    render_login(two_factor=two_factor).encode("utf-8"),
                 )
             except Exception as exc:
                 self._send(400, render_setup(str(exc)).encode("utf-8"))
@@ -1219,25 +1875,55 @@ class WebHandler(BaseHTTPRequestHandler):
         if path == "/login":
             raw = self._read_body().decode("utf-8")
             form = parse_qs(raw)
+            challenge = (form.get("challenge") or [""])[0]
+            code = (form.get("totp_code") or [""])[0]
+            trust_device = bool((form.get("trust_device") or [""])[0])
+            if challenge:
+                payload = verify_two_factor_challenge(challenge)
+                if not payload:
+                    self._send(403, render_login("Two-factor challenge expired. Sign in again.").encode("utf-8"))
+                    return
+                username = str(payload.get("user", "")).strip()
+                purpose = str(payload.get("purpose", "")).strip()
+                managed = get_managed_user(username)
+                if not managed or not managed.get("active", True):
+                    self._send(403, render_login("Invalid login.").encode("utf-8"))
+                    return
+                if purpose == "enroll":
+                    try:
+                        managed = confirm_two_factor_enrollment(username, code)
+                    except Exception as exc:
+                        self._send(403, render_login(str(exc), two_factor=begin_two_factor_enrollment(username)).encode("utf-8"))
+                        return
+                    self._send(303, b"", "text/plain; charset=utf-8", login_headers(username, trust_device, managed))
+                    return
+                if purpose == "verify":
+                    if not two_factor_enabled(managed) or not verify_totp_code(str(managed.get("totp_secret", "")), code):
+                        self._send(403, render_login("Invalid authenticator code.", two_factor=two_factor_verify_context(username)).encode("utf-8"))
+                        return
+                    self._send(303, b"", "text/plain; charset=utf-8", login_headers(username, trust_device, managed))
+                    return
+                self._send(403, render_login("Invalid two-factor challenge.").encode("utf-8"))
+                return
+
             username = (form.get("username") or [""])[0].strip()
             password = (form.get("password") or [""])[0]
             user = verify_login(username, password)
             if user:
-                session = sign_session(user)
-                self._send(
-                    303,
-                    b"",
-                    "text/plain; charset=utf-8",
-                    {
-                        "Set-Cookie": (
-                            f"{SESSION_COOKIE}={session}; Max-Age={SESSION_TTL_SECONDS}; "
-                            "HttpOnly; SameSite=Lax; Path=/"
-                        ),
-                        "Location": "/dashboard",
-                    },
-                )
+                managed = get_managed_user(user) if has_managed_users() else None
+                if managed:
+                    if not two_factor_enabled(managed):
+                        self._send(200, render_login(two_factor=begin_two_factor_enrollment(user)).encode("utf-8"))
+                        return
+                    trusted_cookie = self._cookie_value(TRUSTED_2FA_COOKIE)
+                    if not verify_trusted_device(trusted_cookie, user, managed):
+                        self._send(200, render_login(two_factor=two_factor_verify_context(user)).encode("utf-8"))
+                        return
+                    self._send(303, b"", "text/plain; charset=utf-8", login_headers(user))
+                    return
+                self._send(303, b"", "text/plain; charset=utf-8", login_headers(user))
                 return
-            self._send(403, render_login("Invalid login.").encode("utf-8"))
+            self._send(403, render_login("Invalid login.", username_value=username).encode("utf-8"))
             return
 
         if not self._require_auth():
@@ -1263,6 +1949,55 @@ class WebHandler(BaseHTTPRequestHandler):
                 job.log(f"Queued by {user}.")
                 EXECUTOR.submit(run_scan_job, job)
                 self._json(201, {"job": job.snapshot()})
+            except Exception as exc:
+                self._json(400, {"error": str(exc)})
+            return
+
+        if path == "/api/schedule":
+            if not self._require_scan_permission():
+                return
+            try:
+                payload = self._read_json()
+                user = self._current_user() or "local"
+                item = upsert_scan_schedule(payload, user)
+                jobs = JOBS.list()
+                reports = list_reports()
+                schedule = list_scan_schedule(jobs, reports)
+                self._json(200, {
+                    "item": decorate_schedule_item(item, jobs, reports),
+                    "schedule": schedule,
+                    "overview": scan_overview(schedule, jobs, reports),
+                })
+            except Exception as exc:
+                self._json(400, {"error": str(exc)})
+            return
+
+        if path.startswith("/api/schedule/") and path.endswith("/run"):
+            if not self._require_scan_permission():
+                return
+            try:
+                schedule_id = unquote(path.removeprefix("/api/schedule/").removesuffix("/run").strip("/"))
+                item = get_scan_schedule(schedule_id)
+                if not item:
+                    self._json(404, {"error": "Schedule not found."})
+                    return
+                user = self._current_user() or "local"
+                job = queue_schedule_job(item, user, "schedule")
+                jobs = JOBS.list()
+                reports = list_reports()
+                schedule = list_scan_schedule(jobs, reports)
+                self._json(201, {"job": job.snapshot(), "schedule": schedule, "overview": scan_overview(schedule, jobs, reports)})
+            except Exception as exc:
+                self._json(400, {"error": str(exc)})
+            return
+
+        if path.startswith("/api/users/") and path.endswith("/2fa-reset"):
+            if not self._require_admin():
+                return
+            try:
+                username = unquote(path.removeprefix("/api/users/").removesuffix("/2fa-reset").strip("/"))
+                reset_user_two_factor(username, self._current_user() or "local")
+                self._json(200, {"ok": True, "users": list_managed_users()})
             except Exception as exc:
                 self._json(400, {"error": str(exc)})
             return
@@ -1310,1643 +2045,164 @@ class WebHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json(400, {"error": str(exc)})
             return
+        if path.startswith("/api/schedule/"):
+            if not self._require_scan_permission():
+                return
+            try:
+                schedule_id = unquote(path.rsplit("/", 1)[-1])
+                if not delete_scan_schedule(schedule_id):
+                    self._json(404, {"error": "Schedule not found."})
+                    return
+                jobs = JOBS.list()
+                reports = list_reports()
+                schedule = list_scan_schedule(jobs, reports)
+                self._json(200, {"ok": True, "schedule": schedule, "overview": scan_overview(schedule, jobs, reports)})
+            except Exception as exc:
+                self._json(400, {"error": str(exc)})
+            return
         self._send(404, b"Not found", "text/plain; charset=utf-8")
 
 
+FRONTEND_DIR = BASE_DIR / "web"
+TEMPLATE_DIR = FRONTEND_DIR / "templates"
+STATIC_DIR = FRONTEND_DIR / "static"
+APP_ROUTES = {
+    "/dashboard": "dashboard.html",
+    "/scans": "scans.html",
+    "/reports": "reports.html",
+    "/admin/users": "admin-users.html",
+    "/admin/api-keys": "admin-api-keys.html",
+    "/index.html": "dashboard.html",
+}
+
+
+def safe_static_path(url_path: str) -> Path:
+    rel = unquote(url_path.removeprefix("/static/"))
+    if not rel or rel.startswith("/"):
+        raise FileNotFoundError("Invalid static path.")
+    root = STATIC_DIR.resolve()
+    path = (root / rel).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise FileNotFoundError("Invalid static path.") from exc
+    if not path.is_file():
+        raise FileNotFoundError("Static asset not found.")
+    return path
+
+
+def render_template(name: str, replacements: dict[str, str] | None = None) -> str:
+    path = (TEMPLATE_DIR / name).resolve()
+    try:
+        path.relative_to(TEMPLATE_DIR.resolve())
+    except ValueError as exc:
+        raise FileNotFoundError("Invalid template path.") from exc
+    page = path.read_text(encoding="utf-8")
+    for key, value in (replacements or {}).items():
+        page = page.replace(key, value)
+    return page
+
+
 def render_setup(error: str = "") -> str:
-    error_html = f"<p class='error'>{html.escape(error)}</p>" if error else ""
-    page = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Setup link-ed.it CyberScan</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Poppins:wght@600;700;800;900&display=swap" rel="stylesheet">
-  <style>
-    * { box-sizing: border-box; }
-    body {
-      min-height: 100vh;
-      margin: 0;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-      font-family: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: #eef2fb;
-      background:
-        radial-gradient(900px 520px at 15% -10%, rgba(45, 212, 191, .20), transparent 60%),
-        radial-gradient(820px 540px at 100% 0%, rgba(99, 102, 241, .22), transparent 55%),
-        linear-gradient(180deg, #070b16, #0b1124);
-      background-attachment: fixed;
-    }
-    main {
-      position: relative;
-      width: min(440px, calc(100vw - 32px));
-      background: rgba(18, 25, 48, .72);
-      backdrop-filter: blur(18px);
-      -webkit-backdrop-filter: blur(18px);
-      border: 1px solid rgba(140, 160, 210, .16);
-      border-radius: 20px;
-      padding: 34px 32px;
-      box-shadow: 0 30px 80px -30px rgba(0, 0, 0, .8);
-      overflow: hidden;
-    }
-    main::before {
-      content: "";
-      position: absolute;
-      inset: 0 0 auto 0;
-      height: 3px;
-      background: linear-gradient(135deg, #2dd4bf, #22d3ee 45%, #6366f1);
-    }
-    .mark {
-      width: 52px;
-      height: 52px;
-      display: grid;
-      place-items: center;
-      border-radius: 14px;
-      background: linear-gradient(135deg, #2dd4bf, #22d3ee 45%, #6366f1);
-      color: #04121a;
-      font-weight: 900;
-      font-size: 22px;
-      margin-bottom: 20px;
-      font-family: "Poppins", "Inter", sans-serif;
-      box-shadow: 0 12px 30px -10px rgba(45, 212, 191, .6);
-    }
-    h1 {
-      margin: 0;
-      font-size: 26px;
-      font-family: "Poppins", "Inter", sans-serif;
-      font-weight: 800;
-      letter-spacing: -.01em;
-    }
-    .mode { margin: 8px 0 24px; color: #97a3c4; font-size: 13.5px; }
-    label {
-      display: block;
-      font-size: 12px;
-      font-weight: 700;
-      margin-bottom: 8px;
-      color: #cdd6ee;
-      text-transform: uppercase;
-      letter-spacing: .04em;
-    }
-    input {
-      width: 100%;
-      min-height: 48px;
-      border: 1px solid rgba(140, 160, 210, .2);
-      border-radius: 12px;
-      padding: 0 14px;
-      font: inherit;
-      margin-bottom: 16px;
-      background: rgba(8, 12, 24, .6);
-      color: #f4f7ff;
-      transition: border-color .15s ease, box-shadow .15s ease;
-    }
-    input::placeholder { color: #6c7799; }
-    input:focus {
-      outline: none;
-      border-color: #2dd4bf;
-      box-shadow: 0 0 0 4px rgba(45, 212, 191, .18);
-    }
-    button {
-      width: 100%;
-      min-height: 48px;
-      margin-top: 6px;
-      border: 0;
-      border-radius: 12px;
-      background: linear-gradient(135deg, #2dd4bf, #22d3ee 50%, #6366f1);
-      color: #04121a;
-      font-weight: 800;
-      font-size: 15px;
-      cursor: pointer;
-      font-family: "Poppins", "Inter", sans-serif;
-      box-shadow: 0 14px 34px -14px rgba(45, 212, 191, .7);
-      transition: transform .12s ease, box-shadow .12s ease, filter .12s ease;
-    }
-    button:hover {
-      transform: translateY(-1px);
-      filter: brightness(1.06);
-      box-shadow: 0 18px 40px -14px rgba(45, 212, 191, .85);
-    }
-    button:active { transform: translateY(0); }
-    .error { color: #fb7185; margin: 0 0 16px; font-weight: 700; font-size: 13.5px; }
-  </style>
-</head>
-<body>
-  <main>
-    <div class="mark">L</div>
-    <h1>Initial Admin Setup</h1>
-    <p class="mode">Create the first internal employee admin for link-ed.it CyberScan.</p>
-    __ERROR_HTML__
-    <form method="post" action="/setup">
-      <label for="username">Admin user</label>
-      <input id="username" name="username" type="text" autocomplete="username" autofocus>
-      <label for="password">Password</label>
-      <input id="password" name="password" type="password" autocomplete="new-password">
-      <label for="confirm">Confirm password</label>
-      <input id="confirm" name="confirm" type="password" autocomplete="new-password">
-      <button type="submit">Create admin</button>
-    </form>
-  </main>
-</body>
-</html>"""
-    return page.replace("__ERROR_HTML__", error_html)
+    error_html = f"<p class='notice show'>{html.escape(error)}</p>" if error else ""
+    return render_template("setup.html", {"__ERROR_HTML__": error_html})
 
 
-def render_login(error: str = "") -> str:
-    mode_text = "Team login" if has_managed_users() or WEB_USERS else "Shared access token"
-    error_html = f"<p class='error'>{html.escape(error)}</p>" if error else ""
-    username_value = "" if has_managed_users() or WEB_USERS else "team"
-    page = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>link-ed.it CyberScan Login</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Poppins:wght@600;700;800;900&display=swap" rel="stylesheet">
-  <style>
-    * { box-sizing: border-box; }
-    body {
-      min-height: 100vh;
-      margin: 0;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-      font-family: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: #eef2fb;
-      background:
-        radial-gradient(900px 520px at 15% -10%, rgba(45, 212, 191, .20), transparent 60%),
-        radial-gradient(820px 540px at 100% 0%, rgba(99, 102, 241, .22), transparent 55%),
-        linear-gradient(180deg, #070b16, #0b1124);
-      background-attachment: fixed;
-    }
-    main {
-      position: relative;
-      width: min(440px, calc(100vw - 32px));
-      background: rgba(18, 25, 48, .72);
-      backdrop-filter: blur(18px);
-      -webkit-backdrop-filter: blur(18px);
-      border: 1px solid rgba(140, 160, 210, .16);
-      border-radius: 20px;
-      padding: 34px 32px;
-      box-shadow: 0 30px 80px -30px rgba(0, 0, 0, .8);
-      overflow: hidden;
-    }
-    main::before {
-      content: "";
-      position: absolute;
-      inset: 0 0 auto 0;
-      height: 3px;
-      background: linear-gradient(135deg, #2dd4bf, #22d3ee 45%, #6366f1);
-    }
-    .mark {
-      width: 52px;
-      height: 52px;
-      display: grid;
-      place-items: center;
-      border-radius: 14px;
-      background: linear-gradient(135deg, #2dd4bf, #22d3ee 45%, #6366f1);
-      color: #04121a;
-      font-weight: 900;
-      font-size: 22px;
-      margin-bottom: 20px;
-      font-family: "Poppins", "Inter", sans-serif;
-      box-shadow: 0 12px 30px -10px rgba(45, 212, 191, .6);
-    }
-    h1 {
-      margin: 0;
-      font-size: 26px;
-      font-family: "Poppins", "Inter", sans-serif;
-      font-weight: 800;
-      letter-spacing: -.01em;
-    }
-    .mode { margin: 8px 0 24px; color: #97a3c4; font-size: 13.5px; }
-    label {
-      display: block;
-      font-size: 12px;
-      font-weight: 700;
-      margin-bottom: 8px;
-      color: #cdd6ee;
-      text-transform: uppercase;
-      letter-spacing: .04em;
-    }
-    input {
-      width: 100%;
-      min-height: 48px;
-      border: 1px solid rgba(140, 160, 210, .2);
-      border-radius: 12px;
-      padding: 0 14px;
-      font: inherit;
-      margin-bottom: 16px;
-      background: rgba(8, 12, 24, .6);
-      color: #f4f7ff;
-      transition: border-color .15s ease, box-shadow .15s ease;
-    }
-    input::placeholder { color: #6c7799; }
-    input:focus {
-      outline: none;
-      border-color: #2dd4bf;
-      box-shadow: 0 0 0 4px rgba(45, 212, 191, .18);
-    }
-    button {
-      width: 100%;
-      min-height: 48px;
-      margin-top: 6px;
-      border: 0;
-      border-radius: 12px;
-      background: linear-gradient(135deg, #2dd4bf, #22d3ee 50%, #6366f1);
-      color: #04121a;
-      font-weight: 800;
-      font-size: 15px;
-      cursor: pointer;
-      font-family: "Poppins", "Inter", sans-serif;
-      box-shadow: 0 14px 34px -14px rgba(45, 212, 191, .7);
-      transition: transform .12s ease, box-shadow .12s ease, filter .12s ease;
-    }
-    button:hover {
-      transform: translateY(-1px);
-      filter: brightness(1.06);
-      box-shadow: 0 18px 40px -14px rgba(45, 212, 191, .85);
-    }
-    button:active { transform: translateY(0); }
-    .error { color: #fb7185; margin: 0 0 16px; font-weight: 700; font-size: 13.5px; }
-  </style>
-</head>
-<body>
-  <main>
-    <div class="mark">L</div>
-    <h1>link-ed.it CyberScan</h1>
-    <p class="mode">__MODE_TEXT__</p>
-    __ERROR_HTML__
+def render_primary_login_form(username_value: str) -> str:
+    password_label = "Password" if has_managed_users() or WEB_USERS else "Password / token"
+    return f"""
     <form method="post" action="/login">
-      <label for="username">User</label>
-      <input id="username" name="username" type="text" value="__USERNAME__" autocomplete="username" autofocus>
-      <label for="password">Password / token</label>
-      <input id="password" name="password" type="password" autocomplete="current-password">
-      <button type="submit">Sign in</button>
+      <div class="field">
+        <label for="username">User</label>
+        <input id="username" name="username" type="text" value="{html.escape(username_value)}" autocomplete="username" autofocus>
+      </div>
+      <div class="field">
+        <label for="password">{html.escape(password_label)}</label>
+        <input id="password" name="password" type="password" autocomplete="current-password">
+      </div>
+      <button class="primary" type="submit"><i data-lucide="log-in"></i>Sign in</button>
     </form>
-  </main>
-</body>
-</html>"""
-    return (
-        page
-        .replace("__MODE_TEXT__", html.escape(mode_text))
-        .replace("__ERROR_HTML__", error_html)
-        .replace("__USERNAME__", html.escape(username_value))
+    """
+
+
+def render_two_factor_form(context: dict[str, Any]) -> str:
+    purpose = str(context.get("purpose", "verify"))
+    username = html.escape(str(context.get("username", "")))
+    challenge = html.escape(str(context.get("challenge", "")))
+    trust_checked = "checked" if purpose == "enroll" else ""
+    code_autofocus = "" if purpose == "enroll" else "autofocus"
+    setup_html = ""
+    if purpose == "enroll":
+        qr = str(context.get("qr_data_uri", ""))
+        uri = str(context.get("otpauth_uri", ""))
+        secret = str(context.get("secret", ""))
+        formatted_secret = str(context.get("formatted_secret", ""))
+        qr_html = (
+            f'<img src="{html.escape(qr)}" alt="Authenticator QR code">'
+            if qr else '<div class="qr-fallback"><i data-lucide="qr-code"></i><span>Use setup key</span></div>'
+        )
+        setup_html = f"""
+      <div class="twofa-setup">
+        <div class="twofa-qr">{qr_html}</div>
+        <div>
+          <p class="twofa-copy">Scan the QR code or add the setup key manually in Google Authenticator, Microsoft Authenticator, 1Password or any TOTP app.</p>
+          <div class="secret-box primary-secret">
+            <span>Manual setup key</span>
+            <code>{html.escape(formatted_secret)}</code>
+          </div>
+          <details class="setup-details">
+            <summary>Show raw key and otpauth link</summary>
+            <div class="secret-box">
+              <span>Raw key</span>
+              <code>{html.escape(secret)}</code>
+            </div>
+            <a class="otpauth-link" href="{html.escape(uri)}">Open in authenticator app</a>
+          </details>
+        </div>
+      </div>
+        """
+    return f"""
+    <form method="post" action="/login">
+      <input type="hidden" name="username" value="{username}">
+      <input type="hidden" name="challenge" value="{challenge}">
+      {setup_html}
+      <div class="field">
+        <label for="totp_code">Authenticator code</label>
+        <input id="totp_code" name="totp_code" type="text" inputmode="numeric" pattern="[0-9]{{6}}" maxlength="6" autocomplete="one-time-code" placeholder="123456" {code_autofocus}>
+      </div>
+      <label class="inline-check trust-check">
+        <span>Trust this device for 30 days</span>
+        <input name="trust_device" value="1" type="checkbox" {trust_checked}>
+      </label>
+      <button class="primary" type="submit"><i data-lucide="shield-check"></i><span>Verify and continue</span></button>
+    </form>
+    """
+
+
+def render_login(error: str = "", two_factor: dict[str, Any] | None = None, username_value: str | None = None) -> str:
+    if two_factor:
+        mode_text = (
+            "Set up mandatory two-factor authentication"
+            if two_factor.get("purpose") == "enroll"
+            else "Enter your authenticator app code"
+        )
+        auth_form = render_two_factor_form(two_factor)
+    else:
+        mode_text = "Team login" if has_managed_users() or WEB_USERS else "Shared access token"
+        auth_form = render_primary_login_form(username_value if username_value is not None else ("" if has_managed_users() or WEB_USERS else "team"))
+    error_html = f"<p class='notice show'>{html.escape(error)}</p>" if error else ""
+    return render_template(
+        "login.html",
+        {
+            "__MODE_TEXT__": html.escape(mode_text),
+            "__ERROR_HTML__": error_html,
+            "__AUTH_FORM__": auth_form,
+        },
     )
 
 
-APP_HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>link-ed.it CyberScan</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Poppins:wght@600;700;800;900&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --bg-0: #070b16;
-      --bg-1: #0b1124;
-      --surface: rgba(18, 25, 48, .72);
-      --surface-2: rgba(13, 19, 38, .55);
-      --line: rgba(140, 160, 210, .14);
-      --line-soft: rgba(140, 160, 210, .08);
-      --text: #eef2fb;
-      --muted: #97a3c4;
-      --muted-2: #6c7799;
-      --brand: #2dd4bf;
-      --brand-2: #22d3ee;
-      --brand-3: #6366f1;
-      --grad: linear-gradient(135deg, #2dd4bf 0%, #22d3ee 48%, #6366f1 100%);
-      --green: #2dd4bf;
-      --green-soft: rgba(45, 212, 191, .16);
-      --red: #fb7185;
-      --red-soft: rgba(244, 63, 94, .16);
-      --orange: #fbbf24;
-      --orange-soft: rgba(251, 146, 60, .16);
-      --yellow: #fbbf24;
-      --yellow-soft: rgba(250, 204, 21, .14);
-      --blue: #7dd3fc;
-      --blue-soft: rgba(56, 189, 248, .14);
-      --radius: 16px;
-      --radius-sm: 12px;
-      --shadow: 0 24px 60px -28px rgba(0, 0, 0, .75);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      font-family: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: var(--text);
-      line-height: 1.5;
-      background:
-        radial-gradient(1100px 620px at 10% -8%, rgba(45, 212, 191, .15), transparent 60%),
-        radial-gradient(960px 640px at 100% 0%, rgba(99, 102, 241, .17), transparent 55%),
-        linear-gradient(180deg, var(--bg-0), var(--bg-1));
-      background-attachment: fixed;
-    }
-    h1, h2, h3 { font-family: "Poppins", "Inter", sans-serif; letter-spacing: -.01em; }
-    button, input, select { font: inherit; }
-    button { cursor: pointer; }
-    ::-webkit-scrollbar { width: 10px; height: 10px; }
-    ::-webkit-scrollbar-thumb { background: rgba(140, 160, 210, .22); border-radius: 999px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-
-    /* ---------- Topbar ---------- */
-    .topbar {
-      min-height: 74px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 20px;
-      padding: 0 28px;
-      background: rgba(9, 13, 26, .72);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      border-bottom: 1px solid var(--line);
-      position: sticky;
-      top: 0;
-      z-index: 20;
-    }
-    .brand { display: flex; align-items: center; gap: 13px; min-width: 0; }
-    .brand-mark {
-      width: 40px;
-      height: 40px;
-      display: grid;
-      place-items: center;
-      border-radius: 12px;
-      background: var(--grad);
-      color: #04121a;
-      font-weight: 900;
-      font-family: "Poppins", "Inter", sans-serif;
-      box-shadow: 0 10px 26px -10px rgba(45, 212, 191, .65);
-    }
-    .brand h1 { margin: 0; font-size: 19px; font-weight: 800; }
-    .brand p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
-    .primary-nav {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      min-height: 42px;
-      padding: 5px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: rgba(8, 13, 24, .5);
-    }
-    .primary-nav a {
-      min-height: 32px;
-      display: inline-flex;
-      align-items: center;
-      border-radius: 999px;
-      padding: 0 14px;
-      color: var(--muted);
-      text-decoration: none;
-      font-size: 13px;
-      font-weight: 700;
-      transition: color .15s ease, background .15s ease;
-    }
-    .primary-nav a:hover { color: #fff; background: rgba(140, 160, 210, .12); }
-    .primary-nav a.active { color: #04121a; background: var(--grad); box-shadow: 0 8px 20px -10px rgba(45, 212, 191, .6); }
-    .top-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; flex-wrap: wrap; }
-    .api-strip { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
-    .api-key {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      min-height: 26px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 0 10px;
-      font-size: 12px;
-      font-weight: 600;
-      background: rgba(8, 13, 24, .5);
-      color: var(--muted);
-    }
-    .api-key.on { color: #7df3df; background: rgba(45, 212, 191, .14); border-color: rgba(45, 212, 191, .34); }
-    .api-key.off { color: #f3c97a; background: rgba(250, 204, 21, .12); border-color: rgba(250, 204, 21, .32); }
-    .userbox {
-      display: flex;
-      align-items: center;
-      gap: 9px;
-      min-height: 36px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 0 8px 0 14px;
-      background: rgba(8, 13, 24, .5);
-      color: var(--text);
-      font-size: 13px;
-      font-weight: 700;
-    }
-    .logout {
-      min-height: 26px;
-      display: inline-flex;
-      align-items: center;
-      border-radius: 999px;
-      padding: 0 12px;
-      color: #04121a;
-      background: var(--grad);
-      text-decoration: none;
-      font-size: 12px;
-      font-weight: 800;
-    }
-    .logout:hover { filter: brightness(1.07); }
-
-    /* ---------- Layout ---------- */
-    .layout {
-      width: min(1520px, calc(100vw - 36px));
-      margin: 26px auto 56px;
-      display: grid;
-      grid-template-columns: minmax(380px, 460px) minmax(0, 1fr);
-      gap: 18px;
-      align-items: start;
-    }
-    .route-hidden { display: none !important; }
-    .workspace { display: grid; gap: 18px; }
-    .layout.route-reports,
-    .layout.route-dashboard,
-    .layout.route-admin-users,
-    .layout.route-admin-api-keys { grid-template-columns: minmax(0, 1fr); }
-    .layout.route-reports .workspace,
-    .layout.route-dashboard .workspace,
-    .layout.route-admin-users .workspace,
-    .layout.route-admin-api-keys .workspace { max-width: 1200px; width: 100%; margin: 0 auto; }
-
-    /* ---------- Panels ---------- */
-    .panel {
-      background: var(--surface);
-      backdrop-filter: blur(14px);
-      -webkit-backdrop-filter: blur(14px);
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      overflow: hidden;
-    }
-    .panel-head {
-      min-height: 58px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 0 20px;
-      border-bottom: 1px solid var(--line);
-      background: rgba(255, 255, 255, .02);
-    }
-    .panel-head h2 { margin: 0; font-size: 15px; font-weight: 700; color: #f6f8ff; }
-    .panel-body { padding: 20px; color: var(--muted); }
-
-    /* ---------- Forms ---------- */
-    .field { margin-bottom: 18px; }
-    .field label, .admin-form label {
-      display: block;
-      color: #cdd6ee;
-      font-size: 11px;
-      font-weight: 700;
-      margin-bottom: 8px;
-      text-transform: uppercase;
-      letter-spacing: .05em;
-    }
-    input[type="text"], input[type="password"], select {
-      width: 100%;
-      min-height: 46px;
-      border: 1px solid rgba(140, 160, 210, .2);
-      border-radius: var(--radius-sm);
-      padding: 0 14px;
-      background: rgba(8, 12, 24, .55);
-      color: var(--text);
-      transition: border-color .15s ease, box-shadow .15s ease;
-    }
-    input::placeholder { color: var(--muted-2); }
-    input[type="text"]:focus, input[type="password"]:focus, select:focus {
-      outline: none;
-      border-color: var(--brand);
-      box-shadow: 0 0 0 4px rgba(45, 212, 191, .16);
-    }
-
-    /* ---------- Profiles ---------- */
-    .profiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-    .profile-btn {
-      min-height: 40px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius-sm);
-      background: rgba(8, 13, 24, .4);
-      color: #d6dee9;
-      font-weight: 700;
-      transition: all .15s ease;
-    }
-    .profile-btn:hover { border-color: rgba(140, 160, 210, .4); background: rgba(140, 160, 210, .08); }
-    .profile-btn.active {
-      color: #04121a;
-      background: var(--grad);
-      border-color: transparent;
-      box-shadow: 0 10px 24px -12px rgba(45, 212, 191, .6);
-    }
-
-    /* ---------- Modules ---------- */
-    .modules { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
-    .module {
-      display: grid;
-      grid-template-columns: 22px minmax(0, 1fr);
-      gap: 9px;
-      min-height: 72px;
-      padding: 12px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius-sm);
-      background: var(--surface-2);
-      transition: border-color .15s ease, background .15s ease;
-    }
-    .module.danger { background: rgba(244, 63, 94, .08); border-color: rgba(244, 63, 94, .28); }
-    .module input { width: 18px; height: 18px; margin-top: 2px; accent-color: var(--brand); }
-    .module-title { display: block; font-size: 13px; font-weight: 700; color: #eef2fb; overflow-wrap: anywhere; }
-    .module-desc { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-    .module:has(input:checked) { background: rgba(45, 212, 191, .12); border-color: rgba(45, 212, 191, .42); }
-    .module.danger:has(input:checked) { background: rgba(244, 63, 94, .16); border-color: rgba(244, 63, 94, .5); }
-
-    /* ---------- Toggles ---------- */
-    .toggles { display: grid; gap: 10px; }
-    .switch-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 12px 14px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius-sm);
-      background: var(--surface-2);
-    }
-    .switch-row strong { display: block; font-size: 13px; color: #eef2fb; }
-    .switch-row span { display: block; color: var(--muted); font-size: 12px; }
-    .switch-row input { width: 42px; height: 22px; accent-color: var(--brand); }
-
-    /* ---------- Buttons ---------- */
-    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
-    .primary, .secondary {
-      min-height: 46px;
-      border-radius: var(--radius-sm);
-      border: 1px solid transparent;
-      padding: 0 18px;
-      font-weight: 800;
-      font-family: "Poppins", "Inter", sans-serif;
-      transition: transform .12s ease, box-shadow .12s ease, filter .12s ease, background .15s ease;
-    }
-    .primary {
-      background: var(--grad);
-      color: #04121a;
-      flex: 1 1 210px;
-      box-shadow: 0 14px 34px -16px rgba(45, 212, 191, .7);
-    }
-    .primary:hover { transform: translateY(-1px); filter: brightness(1.06); box-shadow: 0 18px 40px -16px rgba(45, 212, 191, .85); }
-    .primary:active { transform: translateY(0); }
-    .primary:disabled { background: rgba(140, 160, 210, .16); color: var(--muted-2); box-shadow: none; cursor: not-allowed; filter: none; transform: none; }
-    .secondary { background: rgba(140, 160, 210, .06); color: var(--text); border-color: var(--line); }
-    .secondary:hover { background: rgba(140, 160, 210, .14); border-color: rgba(140, 160, 210, .34); }
-
-    /* ---------- Toolbar / icons ---------- */
-    .toolbar { display: flex; align-items: center; gap: 8px; }
-    .icon-button {
-      width: 38px;
-      height: 38px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius-sm);
-      background: rgba(140, 160, 210, .06);
-      color: var(--text);
-      font-size: 18px;
-      line-height: 1;
-      transition: all .15s ease;
-    }
-    .icon-button:hover { background: rgba(140, 160, 210, .14); border-color: rgba(140, 160, 210, .34); }
-
-    /* ---------- Empty ---------- */
-    .empty {
-      min-height: 96px;
-      display: grid;
-      place-items: center;
-      color: var(--muted);
-      background: var(--surface-2);
-      border-radius: var(--radius-sm);
-      border: 1px dashed rgba(140, 160, 210, .26);
-      text-align: center;
-      padding: 16px;
-    }
-
-    /* ---------- Metrics ---------- */
-    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
-    .metric {
-      position: relative;
-      min-height: 96px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: var(--surface);
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
-      padding: 16px;
-      box-shadow: var(--shadow);
-      overflow: hidden;
-    }
-    .metric::before {
-      content: "";
-      position: absolute;
-      inset: 0 auto 0 0;
-      width: 3px;
-      background: var(--grad);
-    }
-    .metric .label { color: var(--muted); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; }
-    .metric .value { margin-top: 8px; font-size: 30px; line-height: 1; font-weight: 800; font-family: "Poppins", "Inter", sans-serif; color: #f6f8ff; }
-    .metric .hint { margin-top: 8px; color: var(--muted); font-size: 12px; }
-
-    /* ---------- Jobs ---------- */
-    .job-list { display: grid; gap: 12px; }
-    .job {
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: var(--surface-2);
-      overflow: hidden;
-      transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
-    }
-    .job:hover { transform: translateY(-1px); border-color: rgba(140, 160, 210, .3); box-shadow: 0 18px 44px -22px rgba(0, 0, 0, .8); }
-    .job-main { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; padding: 14px; }
-    .job h3 { margin: 0; font-size: 15px; font-weight: 700; color: #f6f8ff; overflow-wrap: anywhere; }
-    .job-meta { margin-top: 4px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-    .status {
-      align-self: start;
-      border-radius: 999px;
-      padding: 5px 11px;
-      font-size: 11px;
-      font-weight: 800;
-      text-transform: uppercase;
-      letter-spacing: .03em;
-    }
-    .status.running, .status.completed { color: #7df3df; background: rgba(45, 212, 191, .16); }
-    .status.queued { color: #f3c97a; background: rgba(250, 204, 21, .14); }
-    .status.failed { color: #fda4af; background: rgba(244, 63, 94, .16); }
-    .progress { height: 8px; margin: 0 14px 14px; border-radius: 999px; background: rgba(140, 160, 210, .16); overflow: hidden; }
-    .progress span { display: block; height: 100%; background: var(--grad); width: 0; transition: width .3s ease; }
-    .logs {
-      margin: 0;
-      padding: 12px 14px;
-      max-height: 180px;
-      overflow: auto;
-      border-top: 1px solid var(--line);
-      background: rgba(3, 6, 16, .7);
-      color: #c9d6e2;
-      font: 12px/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-      white-space: pre-wrap;
-    }
-
-    /* ---------- Tables ---------- */
-    .reports, .users-table { width: 100%; border-collapse: collapse; }
-    .reports th, .users-table th {
-      text-align: left;
-      font-size: 11px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: .05em;
-      border-bottom: 1px solid var(--line);
-      padding: 10px 8px;
-    }
-    .reports td, .users-table td {
-      border-bottom: 1px solid var(--line-soft);
-      padding: 12px 8px;
-      vertical-align: top;
-      font-size: 13px;
-      color: #dbe2f3;
-      overflow-wrap: anywhere;
-    }
-    .users-table td { vertical-align: middle; }
-    .reports tbody tr:hover { background: rgba(140, 160, 210, .05); }
-
-    /* ---------- Admin ---------- */
-    .admin-grid { display: grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr); gap: 16px; align-items: start; }
-    .admin-form {
-      display: grid;
-      gap: 12px;
-      padding: 16px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: var(--surface-2);
-    }
-    .admin-form label { display: grid; gap: 6px; }
-    .inline-check {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      min-height: 44px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius-sm);
-      padding: 0 14px;
-      background: rgba(8, 13, 24, .4);
-      font-size: 13px;
-      font-weight: 700;
-      color: #eef2fb;
-      text-transform: none;
-      letter-spacing: 0;
-    }
-    .key-list {
-      display: grid;
-      gap: 12px;
-    }
-    .key-row {
-      display: grid;
-      grid-template-columns: minmax(220px, .85fr) minmax(260px, 1fr) 120px;
-      gap: 14px;
-      align-items: start;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: var(--surface-2);
-      padding: 16px;
-    }
-    .key-row h3 {
-      margin: 0;
-      font-size: 14px;
-      font-weight: 700;
-      color: #f6f8ff;
-    }
-    .key-row p {
-      margin: 5px 0 0;
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.45;
-    }
-    .key-row code {
-      display: inline-flex;
-      margin-top: 8px;
-      color: #7df3df;
-      font-size: 12px;
-      overflow-wrap: anywhere;
-    }
-    .key-controls {
-      display: grid;
-      gap: 8px;
-    }
-    .key-clear {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-    }
-    .key-status {
-      justify-self: end;
-      align-self: start;
-      border-radius: 999px;
-      padding: 5px 10px;
-      font-size: 11px;
-      font-weight: 800;
-      text-transform: uppercase;
-      letter-spacing: .03em;
-      background: rgba(244, 63, 94, .16);
-      color: #fda4af;
-    }
-    .key-status.on {
-      background: rgba(45, 212, 191, .16);
-      color: #7df3df;
-    }
-
-    /* ---------- Dashboard overview ---------- */
-    .dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(280px, .9fr); gap: 16px; }
-    .overview-block {
-      min-height: 150px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: var(--surface-2);
-      padding: 18px;
-    }
-    .overview-block h3 { margin: 0 0 14px; font-size: 14px; font-weight: 700; color: #f6f8ff; }
-    .overview-main { font-size: 28px; line-height: 1.1; font-weight: 800; font-family: "Poppins", "Inter", sans-serif; color: #f6f8ff; overflow-wrap: anywhere; }
-    .overview-meta { margin-top: 8px; color: var(--muted); font-size: 13px; }
-    .compact-list { display: grid; gap: 8px; }
-    .compact-row {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 12px;
-      align-items: center;
-      min-height: 46px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius-sm);
-      padding: 9px 12px;
-      background: rgba(8, 13, 24, .4);
-    }
-    .compact-row strong { display: block; color: #eef2fb; font-size: 13px; overflow-wrap: anywhere; }
-    .compact-row span { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-
-    /* ---------- Risk / chips ---------- */
-    .risk {
-      display: inline-flex;
-      min-width: 70px;
-      justify-content: center;
-      border-radius: 999px;
-      padding: 4px 10px;
-      font-size: 11px;
-      font-weight: 800;
-      background: rgba(56, 189, 248, .14);
-      color: #a7c7f8;
-    }
-    .risk.CRITICAL, .risk.HIGH { background: rgba(244, 63, 94, .16); color: #fda4af; }
-    .risk.MEDIUM { background: rgba(251, 146, 60, .16); color: #f3c97a; }
-    .risk.LOW { background: rgba(74, 222, 128, .14); color: #9be8a0; }
-    .chip-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      min-height: 24px;
-      border-radius: 999px;
-      padding: 0 10px;
-      background: rgba(140, 160, 210, .12);
-      color: #cbd5e1;
-      font-size: 11px;
-      font-weight: 700;
-    }
-    .chip.danger { background: rgba(244, 63, 94, .16); color: #fda4af; }
-    .chip.ok { background: rgba(45, 212, 191, .16); color: #7df3df; }
-
-    /* ---------- Link actions ---------- */
-    .link-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-    .link-actions a {
-      min-height: 32px;
-      display: inline-flex;
-      align-items: center;
-      border: 1px solid var(--line);
-      border-radius: var(--radius-sm);
-      padding: 0 11px;
-      color: var(--text);
-      text-decoration: none;
-      font-weight: 700;
-      font-size: 13px;
-      background: rgba(140, 160, 210, .06);
-      transition: all .15s ease;
-    }
-    .link-actions a:hover { background: rgba(140, 160, 210, .14); border-color: rgba(140, 160, 210, .34); }
-    .link-actions .download-button {
-      color: #06131b;
-      background: var(--grad);
-      border-color: transparent;
-    }
-    .link-actions .download-button:hover { filter: brightness(1.06); border-color: transparent; }
-    .report-actions-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
-
-    /* ---------- Notice ---------- */
-    .notice {
-      display: none;
-      margin-top: 14px;
-      border-radius: var(--radius-sm);
-      padding: 12px 14px;
-      background: rgba(244, 63, 94, .14);
-      border: 1px solid rgba(244, 63, 94, .32);
-      color: #fda4af;
-      font-weight: 700;
-      overflow-wrap: anywhere;
-    }
-    .notice.show { display: block; }
-
-    /* ---------- Responsive ---------- */
-    @media (max-width: 980px) {
-      .topbar { align-items: flex-start; flex-direction: column; padding: 16px; gap: 12px; }
-      .api-strip { justify-content: flex-start; }
-      .top-actions { justify-content: flex-start; }
-      .layout { grid-template-columns: 1fr; width: min(760px, calc(100vw - 24px)); }
-      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .admin-grid { grid-template-columns: 1fr; }
-      .dashboard-grid { grid-template-columns: 1fr; }
-      .key-row { grid-template-columns: 1fr; }
-      .key-status { justify-self: start; }
-    }
-    @media (max-width: 560px) {
-      .modules, .profiles { grid-template-columns: 1fr; }
-      .panel-body { padding: 14px; }
-      .job-main { grid-template-columns: 1fr; }
-      .reports th:nth-child(4), .reports td:nth-child(4) { display: none; }
-      .metrics { grid-template-columns: 1fr; }
-      .primary-nav { flex-wrap: wrap; }
-    }
-  </style>
-</head>
-<body>
-  <header class="topbar">
-    <div class="brand">
-      <div class="brand-mark" aria-hidden="true">L</div>
-      <div>
-        <h1>link-ed.it CyberScan</h1>
-        <p>Internal customer-domain security scans</p>
-      </div>
-    </div>
-    <nav class="primary-nav" aria-label="Main navigation">
-      <a href="/dashboard" data-route-link="dashboard">Dashboard</a>
-      <a href="/scans" data-route-link="scans">Scans</a>
-      <a href="/reports" data-route-link="reports">Reports</a>
-      <a href="/admin/users" data-route-link="admin-users" data-admin-only="true">Users</a>
-      <a href="/admin/api-keys" data-route-link="admin-api-keys" data-admin-only="true">API Keys</a>
-    </nav>
-    <div class="top-actions">
-      <div id="apiKeys" class="api-strip"></div>
-      <div class="userbox">
-        <span id="userLabel">local</span>
-        <a class="logout" href="/logout">Logout</a>
-      </div>
-    </div>
-  </header>
-
-  <main id="appLayout" class="layout route-dashboard">
-    <section id="scanPanel" class="panel route-hidden">
-      <div class="panel-head">
-        <h2>Customer Scan</h2>
-      </div>
-      <div class="panel-body">
-        <div class="field">
-          <label for="domain">Customer domain</label>
-          <input id="domain" type="text" placeholder="kunde.de" autocomplete="off">
-        </div>
-
-        <div class="field">
-          <label>Profile</label>
-          <div id="profiles" class="profiles"></div>
-        </div>
-
-        <div class="field">
-          <label>Modules</label>
-          <div id="modules" class="modules"></div>
-        </div>
-
-        <div class="field">
-          <label>Options</label>
-          <div class="toggles">
-            <label class="switch-row">
-              <span><strong>Rate jitter</strong><span>Jitter and browser-like request headers</span></span>
-              <input id="stealth" type="checkbox" checked>
-            </label>
-            <label class="switch-row">
-              <span><strong>Exploit mode</strong><span>Required for module 11</span></span>
-              <input id="exploit" type="checkbox">
-            </label>
-            <label class="switch-row">
-              <span><strong>Fresh scan</strong><span>Ignore stored checkpoint</span></span>
-              <input id="fresh" type="checkbox">
-            </label>
-            <label class="switch-row">
-              <span><strong>Customer authorization</strong><span>Written approval or contract scope is confirmed</span></span>
-              <input id="authorized" type="checkbox">
-            </label>
-          </div>
-        </div>
-
-        <div class="actions">
-          <button id="startScan" class="primary" type="button">Start customer scan</button>
-          <button id="selectSafe" class="secondary" type="button">Internal default</button>
-        </div>
-        <div id="notice" class="notice"></div>
-      </div>
-    </section>
-
-    <div class="workspace">
-      <section id="metrics" class="metrics"></section>
-
-      <section id="dashboardPanel" class="panel">
-        <div class="panel-head">
-          <h2>Operations Overview</h2>
-        </div>
-        <div class="panel-body">
-          <div id="dashboardContent"></div>
-        </div>
-      </section>
-
-      <section id="jobsPanel" class="panel route-hidden">
-        <div class="panel-head">
-          <h2>Scans</h2>
-          <div class="toolbar">
-            <button id="refresh" class="icon-button" type="button" title="Refresh" aria-label="Refresh">&#8635;</button>
-          </div>
-        </div>
-        <div class="panel-body">
-          <div id="jobs" class="job-list"></div>
-        </div>
-      </section>
-
-      <section id="reportsPanel" class="panel route-hidden">
-        <div class="panel-head">
-          <h2>Reports</h2>
-        </div>
-        <div class="panel-body">
-          <div id="reports"></div>
-        </div>
-      </section>
-
-      <section id="adminPanel" class="panel route-hidden" hidden>
-        <div class="panel-head">
-          <h2>User Management</h2>
-        </div>
-        <div class="panel-body">
-          <div class="admin-grid">
-            <div class="admin-form">
-              <label>Username
-                <input id="adminUsername" type="text" placeholder="max.mustermann" autocomplete="off">
-              </label>
-              <label>Password
-                <input id="adminPassword" type="password" placeholder="leave blank to keep existing password" autocomplete="new-password">
-              </label>
-              <label>Role
-                <select id="adminRole"></select>
-              </label>
-              <label class="inline-check">
-                <span>Active</span>
-                <input id="adminActive" type="checkbox" checked>
-              </label>
-              <button id="saveUser" class="primary" type="button">Save user</button>
-              <div id="adminNotice" class="notice"></div>
-            </div>
-            <div id="users"></div>
-          </div>
-        </div>
-      </section>
-
-      <section id="apiKeysPanel" class="panel route-hidden" hidden>
-        <div class="panel-head">
-          <h2>API Keys</h2>
-        </div>
-        <div class="panel-body">
-          <div id="apiKeyEditor"></div>
-          <div class="actions">
-            <button id="saveApiKeys" class="primary" type="button">Save API keys</button>
-          </div>
-          <div id="apiKeyNotice" class="notice"></div>
-        </div>
-      </section>
-    </div>
-  </main>
-
-  <script>
-    const state = {
-      modules: [],
-      profiles: [],
-      roles: [],
-      users: [],
-      apiKeys: [],
-      selectedProfile: "full_recon",
-      route: routeFromPath(),
-      user: "local",
-      userRole: "viewer",
-      isAdmin: false,
-      canScan: false
-    };
-
-    const $ = (id) => document.getElementById(id);
-
-    function routeFromPath() {
-      if (location.pathname === "/dashboard") return "dashboard";
-      if (location.pathname === "/reports") return "reports";
-      if (location.pathname === "/admin" || location.pathname === "/admin/users") return "admin-users";
-      if (location.pathname === "/admin/api-keys") return "admin-api-keys";
-      if (location.pathname === "/scans") return "scans";
-      return "dashboard";
-    }
-
-    function setRoute(route, replace = false) {
-      state.route = route;
-      const paths = {
-        "dashboard": "/dashboard",
-        "scans": "/scans",
-        "reports": "/reports",
-        "admin-users": "/admin/users",
-        "admin-api-keys": "/admin/api-keys"
-      };
-      const path = paths[route] || "/dashboard";
-      if (location.pathname !== path) {
-        history[replace ? "replaceState" : "pushState"]({}, "", path);
-      }
-      renderRoute();
-    }
-
-    function toggleRouteNode(id, visible) {
-      const node = $(id);
-      if (node) node.classList.toggle("route-hidden", !visible);
-    }
-
-    function renderRoute() {
-      if (state.route.startsWith("admin-") && !state.isAdmin) {
-        setRoute("dashboard", true);
-        return;
-      }
-      $("appLayout").className = `layout route-${state.route}`;
-      toggleRouteNode("scanPanel", state.route === "scans");
-      toggleRouteNode("metrics", state.route === "dashboard");
-      toggleRouteNode("dashboardPanel", state.route === "dashboard");
-      toggleRouteNode("jobsPanel", state.route === "scans");
-      toggleRouteNode("reportsPanel", state.route === "reports");
-      toggleRouteNode("adminPanel", state.route === "admin-users" && state.isAdmin);
-      toggleRouteNode("apiKeysPanel", state.route === "admin-api-keys" && state.isAdmin);
-      document.querySelectorAll("[data-route-link]").forEach((node) => {
-        const adminOnly = node.dataset.adminOnly === "true";
-        node.style.display = adminOnly && !state.isAdmin ? "none" : "inline-flex";
-        node.classList.toggle("active", node.dataset.routeLink === state.route);
-      });
-    }
-
-    function showNotice(message) {
-      setNotice("notice", message);
-    }
-
-    function showAdminNotice(message) {
-      setNotice("adminNotice", message);
-    }
-
-    function showApiKeyNotice(message) {
-      setNotice("apiKeyNotice", message);
-    }
-
-    function setNotice(id, message) {
-      const node = $(id);
-      node.textContent = message || "";
-      node.classList.toggle("show", Boolean(message));
-    }
-
-    function selectedModules() {
-      return [...document.querySelectorAll("[data-module]:checked")].map((node) => Number(node.value));
-    }
-
-    function setModules(modules) {
-      const selected = new Set(modules);
-      document.querySelectorAll("[data-module]").forEach((node) => {
-        node.checked = selected.has(Number(node.value));
-      });
-    }
-
-    function renderApiKeys(keys) {
-      const rows = Object.entries(keys || {}).map(([name, on]) => {
-        const cls = on ? "on" : "off";
-        const label = on ? "set" : "missing";
-        return `<span class="api-key ${cls}">${escapeHtml(name)}: ${label}</span>`;
-      });
-      $("apiKeys").innerHTML = rows.join("");
-    }
-
-    function renderUser(user, authMode, role) {
-      state.user = user || "local";
-      state.userRole = role || "viewer";
-      $("userLabel").textContent = `${state.user} (${state.userRole})`;
-      document.querySelector(".logout").style.display = authMode === "open" ? "none" : "inline-flex";
-    }
-
-    function renderPermissions(canScan) {
-      state.canScan = Boolean(canScan);
-      $("startScan").disabled = !state.canScan;
-      $("startScan").textContent = state.canScan ? "Start customer scan" : "Scanner role required";
-    }
-
-    function renderMetrics(jobs, reports, maxWorkers) {
-      const running = (jobs || []).filter((job) => job.status === "running").length;
-      const queued = (jobs || []).filter((job) => job.status === "queued").length;
-      const failed = (jobs || []).filter((job) => job.status === "failed").length;
-      const pdfs = (reports || []).filter((report) => report.type === "pdf").length;
-      const critical = (reports || []).filter((report) => report.risk_label === "CRITICAL").length;
-      $("metrics").innerHTML = [
-        { label: "Active Scans", value: running, hint: `${maxWorkers || 1} worker slot(s)` },
-        { label: "Queued", value: queued, hint: "Waiting jobs" },
-        { label: "PDF Reports", value: pdfs, hint: "Generated customer PDFs" },
-        { label: "Critical", value: critical, hint: failed ? `${failed} failed scan(s)` : "Highest risk reports" }
-      ].map((item) => (
-        `<div class="metric">
-          <div class="label">${escapeHtml(item.label)}</div>
-          <div class="value">${escapeHtml(item.value)}</div>
-          <div class="hint">${escapeHtml(item.hint)}</div>
-        </div>`
-      )).join("");
-    }
-
-    function renderDashboard(jobs, reports) {
-      const latestJob = (jobs || [])[0];
-      const latestPdfs = (reports || []).filter((report) => report.type === "pdf").slice(0, 6);
-      const latestReports = (reports || []).slice(0, 5);
-      const latestScanHtml = latestJob ? `
-        <div class="overview-main">${escapeHtml(latestJob.domain)}</div>
-        <div class="overview-meta">${escapeHtml(latestJob.status)} · ${escapeHtml(latestJob.phase || "No phase")} · by ${escapeHtml(latestJob.created_by || "-")}</div>
-        <div class="chip-row">
-          <span class="chip">${escapeHtml((latestJob.modules || []).length)} module(s)</span>
-          <span class="chip ${latestJob.authorized ? "ok" : "danger"}">${latestJob.authorized ? "authorized" : "authorization missing"}</span>
-          ${latestJob.generated_files?.length ? `<span class="chip ok">${latestJob.generated_files.length} file(s)</span>` : ""}
-        </div>
-      ` : `<div class="empty">No scan jobs yet.</div>`;
-
-      const pdfRows = latestPdfs.length ? latestPdfs.map((report) => `
-        <div class="compact-row">
-          <div>
-            <strong>${escapeHtml(report.domain)}</strong>
-            <span>${escapeHtml(report.file)} · ${escapeHtml(formatDate(report.modified))}</span>
-          </div>
-          ${reportLinkActions(report.url, "PDF", report.download_url)}
-        </div>
-      `).join("") : `<div class="empty">No PDFs generated yet.</div>`;
-
-      const reportRows = latestReports.length ? latestReports.map((report) => `
-        <div class="compact-row">
-          <div>
-            <strong>${escapeHtml(report.domain)}</strong>
-            <span>${escapeHtml(report.type.toUpperCase())} · risk ${escapeHtml(report.risk_label || "-")} · ${escapeHtml(formatDate(report.modified))}</span>
-          </div>
-          ${reportLinkActions(report.url, reportActionLabel(report.url), report.download_url)}
-        </div>
-      `).join("") : `<div class="empty">No reports found.</div>`;
-
-      $("dashboardContent").innerHTML = `
-        <div class="dashboard-grid">
-          <div class="overview-block">
-            <h3>Latest Scan</h3>
-            ${latestScanHtml}
-          </div>
-          <div class="overview-block">
-            <h3>Latest PDFs</h3>
-            <div class="compact-list">${pdfRows}</div>
-          </div>
-          <div class="overview-block" style="grid-column: 1 / -1">
-            <h3>Latest Report Files</h3>
-            <div class="compact-list">${reportRows}</div>
-          </div>
-        </div>`;
-    }
-
-    function renderProfiles() {
-      $("profiles").innerHTML = state.profiles.map((profile) => (
-        `<button type="button" class="profile-btn ${profile.id === state.selectedProfile ? "active" : ""}" data-profile="${profile.id}">
-          ${escapeHtml(profile.name)}
-        </button>`
-      )).join("");
-      document.querySelectorAll("[data-profile]").forEach((node) => {
-        node.addEventListener("click", () => {
-          const profile = state.profiles.find((item) => item.id === node.dataset.profile);
-          if (!profile) return;
-          state.selectedProfile = profile.id;
-          setModules(profile.modules);
-          $("exploit").checked = Boolean(profile.exploit);
-          renderProfiles();
-        });
-      });
-    }
-
-    function renderModules() {
-      $("modules").innerHTML = state.modules.map((module) => (
-        `<label class="module ${module.danger ? "danger" : ""}">
-          <input data-module type="checkbox" value="${module.id}" ${module.default ? "checked" : ""}>
-          <span>
-            <span class="module-title">${module.id}. ${escapeHtml(module.name)}</span>
-            <span class="module-desc">${escapeHtml(module.description)}</span>
-          </span>
-        </label>`
-      )).join("");
-    }
-
-    function renderJobs(jobs) {
-      if (!jobs || !jobs.length) {
-        $("jobs").innerHTML = `<div class="empty">No scans yet.</div>`;
-        return;
-      }
-      $("jobs").innerHTML = jobs.map((job) => {
-        const links = (job.generated_files || []).map((url) => reportLinkActions(url, reportActionLabel(url))).join(" ");
-        const logs = (job.logs || []).slice(-18).map(escapeHtml).join("\\n");
-        const chips = [
-          `<span class="chip">by ${escapeHtml(job.created_by || "local")}</span>`,
-          `<span class="chip ${job.stealth ? "ok" : ""}">jitter ${job.stealth ? "on" : "off"}</span>`,
-          job.exploit ? `<span class="chip danger">exploit on</span>` : `<span class="chip">safe</span>`,
-          job.fresh ? `<span class="chip">fresh</span>` : "",
-          job.authorized ? `<span class="chip ok">authorized</span>` : `<span class="chip danger">no auth</span>`
-        ].filter(Boolean).join("");
-        return `<article class="job">
-          <div class="job-main">
-            <div>
-              <h3>${escapeHtml(job.domain)}</h3>
-              <div class="job-meta">${escapeHtml(job.phase || "")} &middot; modules ${escapeHtml((job.modules || []).join(", "))}</div>
-              <div class="chip-row">${chips}</div>
-              ${job.error ? `<div class="job-meta" style="color: var(--red); font-weight: 800">${escapeHtml(job.error)}</div>` : ""}
-              ${links ? `<div class="report-actions-list">${links}</div>` : ""}
-            </div>
-            <span class="status ${escapeHtml(job.status)}">${escapeHtml(job.status)}</span>
-          </div>
-          <div class="progress"><span style="width:${Number(job.progress || 0)}%"></span></div>
-          <pre class="logs">${logs}</pre>
-        </article>`;
-      }).join("");
-    }
-
-    function renderReports(reports) {
-      if (!reports || !reports.length) {
-        $("reports").innerHTML = `<div class="empty">No reports found.</div>`;
-        return;
-      }
-      const rows = reports.map((report) => {
-        const risk = report.risk_label || "-";
-        const when = formatDate(report.scan_date || report.modified);
-        const action = report.type === "html" ? "HTML" : report.type === "pdf" ? "PDF" : "JSON";
-        return `<tr>
-          <td><strong>${escapeHtml(report.domain)}</strong><br><span class="job-meta">${escapeHtml(report.file)}</span></td>
-          <td><span class="risk ${escapeHtml(risk)}">${escapeHtml(risk)}</span></td>
-          <td>${escapeHtml(report.findings ?? "-")}</td>
-          <td>${escapeHtml(when)}</td>
-          <td>${reportLinkActions(report.url, action, report.download_url)}</td>
-        </tr>`;
-      }).join("");
-      $("reports").innerHTML = `<table class="reports">
-        <thead><tr><th>Target</th><th>Risk</th><th>Findings</th><th>Date</th><th>Actions</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>`;
-    }
-
-    function reportActionLabel(url) {
-      if (String(url).endsWith(".html")) return "HTML";
-      if (String(url).endsWith(".pdf")) return "PDF";
-      return "JSON";
-    }
-
-    function downloadUrl(url) {
-      const separator = String(url).includes("?") ? "&" : "?";
-      return `${url}${separator}download=1`;
-    }
-
-    function reportLinkActions(url, label, explicitDownloadUrl) {
-      const safeUrl = escapeHtml(url || "#");
-      const safeDownloadUrl = escapeHtml(explicitDownloadUrl || downloadUrl(url || "#"));
-      const safeLabel = escapeHtml(label || "Open");
-      return `<div class="link-actions">
-        <a href="${safeUrl}" target="_blank" rel="noreferrer">${safeLabel}</a>
-        <a class="download-button" href="${safeDownloadUrl}" download>Download</a>
-      </div>`;
-    }
-
-    function renderAdminRoles() {
-      $("adminRole").innerHTML = (state.roles || []).map((role) => (
-        `<option value="${escapeHtml(role.id)}">${escapeHtml(role.label)}</option>`
-      )).join("");
-    }
-
-    function renderAdminPanel(isAdmin, users, roles) {
-      state.isAdmin = Boolean(isAdmin);
-      state.users = users || [];
-      state.roles = roles || [];
-      $("adminPanel").hidden = false;
-      $("apiKeysPanel").hidden = false;
-      if (!state.isAdmin) return;
-      renderAdminRoles();
-      renderUsers();
-    }
-
-    function renderApiKeyEditor(apiKeys) {
-      state.apiKeys = apiKeys || [];
-      if (!state.isAdmin) return;
-      if (!state.apiKeys.length) {
-        $("apiKeyEditor").innerHTML = `<div class="empty">No API key definitions found.</div>`;
-        return;
-      }
-      $("apiKeyEditor").innerHTML = `<div class="key-list">${state.apiKeys.map((key) => `
-        <div class="key-row">
-          <div>
-            <h3>${escapeHtml(key.label)}</h3>
-            <p>${escapeHtml(key.description)}</p>
-            <code>${escapeHtml(key.env)}${key.masked ? ` · ${escapeHtml(key.masked)}` : ""}</code>
-          </div>
-          <div class="key-controls">
-            <input data-api-key="${escapeHtml(key.env)}" type="password" placeholder="${key.configured ? "leave blank to keep current key" : "paste API key"}" autocomplete="off">
-            <label class="key-clear">
-              <input data-api-clear="${escapeHtml(key.env)}" type="checkbox">
-              Clear saved value
-            </label>
-          </div>
-          <span class="key-status ${key.configured ? "on" : ""}">${key.configured ? "configured" : "missing"}</span>
-        </div>
-      `).join("")}</div>`;
-    }
-
-    function renderUsers() {
-      if (!state.users.length) {
-        $("users").innerHTML = `<div class="empty">No managed users yet.</div>`;
-        return;
-      }
-      const rows = state.users.map((user) => (
-        `<tr>
-          <td><strong>${escapeHtml(user.username)}</strong><br><span class="job-meta">${escapeHtml(user.source || "local")}</span></td>
-          <td><span class="chip ${user.role === "admin" ? "ok" : ""}">${escapeHtml(user.role)}</span></td>
-          <td>${user.active ? '<span class="chip ok">active</span>' : '<span class="chip danger">disabled</span>'}</td>
-          <td>${escapeHtml(formatDate(user.updated_at || user.created_at))}</td>
-          <td>
-            <div class="link-actions">
-              <button class="secondary" type="button" data-edit-user="${escapeHtml(user.username)}">Edit</button>
-              <button class="secondary" type="button" data-delete-user="${escapeHtml(user.username)}">Delete</button>
-            </div>
-          </td>
-        </tr>`
-      )).join("");
-      $("users").innerHTML = `<table class="users-table">
-        <thead><tr><th>User</th><th>Role</th><th>Status</th><th>Updated</th><th>Actions</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>`;
-      document.querySelectorAll("[data-edit-user]").forEach((node) => {
-        node.addEventListener("click", () => fillUserForm(node.dataset.editUser));
-      });
-      document.querySelectorAll("[data-delete-user]").forEach((node) => {
-        node.addEventListener("click", () => deleteUser(node.dataset.deleteUser));
-      });
-    }
-
-    function fillUserForm(username) {
-      const user = state.users.find((item) => item.username === username);
-      if (!user) return;
-      $("adminUsername").value = user.username;
-      $("adminPassword").value = "";
-      $("adminRole").value = user.role;
-      $("adminActive").checked = Boolean(user.active);
-      showAdminNotice("");
-    }
-
-    async function load() {
-      const response = await fetch("/api/bootstrap", { cache: "no-store" });
-      if (!response.ok) {
-        if (response.status === 401) location.reload();
-        return;
-      }
-      const data = await response.json();
-      if (!state.modules.length) {
-        state.modules = data.modules || [];
-        state.profiles = data.profiles || [];
-        renderModules();
-        renderProfiles();
-      }
-      renderUser(data.user, data.auth_mode, data.user_role);
-      renderPermissions(data.can_scan);
-      renderApiKeys(data.api_keys);
-      renderJobs(data.jobs);
-      renderReports(data.reports);
-      renderMetrics(data.jobs, data.reports, data.max_workers);
-      renderDashboard(data.jobs, data.reports);
-      renderAdminPanel(data.is_admin, data.users, data.roles);
-      renderApiKeyEditor(data.api_key_status || []);
-      renderRoute();
-    }
-
-    async function startScan() {
-      showNotice("");
-      if (!state.canScan) {
-        showNotice("Your user role cannot start scans.");
-        return;
-      }
-      const modules = selectedModules();
-      const payload = {
-        domain: $("domain").value.trim(),
-        modules,
-        stealth: $("stealth").checked,
-        exploit: $("exploit").checked,
-        fresh: $("fresh").checked,
-        authorized: $("authorized").checked
-      };
-      if (!payload.authorized) {
-        showNotice("Confirm customer authorization before starting the scan.");
-        return;
-      }
-      if (modules.includes(11) && !payload.exploit) {
-        showNotice("Module 11 needs exploit mode.");
-        return;
-      }
-      $("startScan").disabled = true;
-      try {
-        const response = await fetch("/api/scans", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "Scan could not be started.");
-        $("domain").value = "";
-        $("authorized").checked = false;
-        await load();
-      } catch (error) {
-        showNotice(error.message);
-      } finally {
-        $("startScan").disabled = !state.canScan;
-      }
-    }
-
-    async function saveUser() {
-      showAdminNotice("");
-      const payload = {
-        username: $("adminUsername").value.trim(),
-        password: $("adminPassword").value,
-        role: $("adminRole").value,
-        active: $("adminActive").checked
-      };
-      $("saveUser").disabled = true;
-      try {
-        const response = await fetch("/api/users", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "User could not be saved.");
-        $("adminPassword").value = "";
-        await load();
-      } catch (error) {
-        showAdminNotice(error.message);
-      } finally {
-        $("saveUser").disabled = false;
-      }
-    }
-
-    async function deleteUser(username) {
-      showAdminNotice("");
-      if (!confirm(`Delete user ${username}?`)) return;
-      try {
-        const response = await fetch(`/api/users/${encodeURIComponent(username)}`, { method: "DELETE" });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "User could not be deleted.");
-        await load();
-      } catch (error) {
-        showAdminNotice(error.message);
-      }
-    }
-
-    async function saveApiKeys() {
-      showApiKeyNotice("");
-      const values = {};
-      const clear = [];
-      document.querySelectorAll("[data-api-key]").forEach((node) => {
-        const value = node.value.trim();
-        if (value) values[node.dataset.apiKey] = value;
-      });
-      document.querySelectorAll("[data-api-clear]:checked").forEach((node) => {
-        clear.push(node.dataset.apiClear);
-      });
-      if (!Object.keys(values).length && !clear.length) {
-        showApiKeyNotice("No API key changes to save.");
-        return;
-      }
-      $("saveApiKeys").disabled = true;
-      try {
-        const response = await fetch("/api/admin/api-keys", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ values, clear })
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "API keys could not be saved.");
-        state.apiKeys = data.api_keys || [];
-        renderApiKeyEditor(state.apiKeys);
-        showApiKeyNotice("API keys saved.");
-        await load();
-      } catch (error) {
-        showApiKeyNotice(error.message);
-      } finally {
-        $("saveApiKeys").disabled = false;
-      }
-    }
-
-    function escapeHtml(value) {
-      return String(value ?? "").replace(/[&<>"']/g, (char) => ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#039;"
-      }[char]));
-    }
-
-    function formatDate(value) {
-      if (!value) return "-";
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return value;
-      return date.toLocaleString();
-    }
-
-    $("startScan").addEventListener("click", startScan);
-    $("saveUser").addEventListener("click", saveUser);
-    $("saveApiKeys").addEventListener("click", saveApiKeys);
-    document.querySelectorAll("[data-route-link]").forEach((node) => {
-      node.addEventListener("click", (event) => {
-        event.preventDefault();
-        setRoute(node.dataset.routeLink || "scans");
-      });
-    });
-    window.addEventListener("popstate", () => {
-      state.route = routeFromPath();
-      renderRoute();
-    });
-    $("refresh").addEventListener("click", load);
-    $("selectSafe").addEventListener("click", () => {
-      const profile = state.profiles.find((item) => item.id === "full_recon");
-      if (profile) {
-        state.selectedProfile = profile.id;
-        setModules(profile.modules);
-        $("exploit").checked = false;
-        renderProfiles();
-      }
-    });
-    $("exploit").addEventListener("change", () => {
-      const module11 = document.querySelector('[data-module][value="11"]');
-      if (module11 && $("exploit").checked) module11.checked = true;
-    });
-
-    load();
-    setInterval(load, 5000);
-  </script>
-</body>
-</html>"""
+def render_app_page(url_path: str) -> str:
+    return render_template(APP_ROUTES.get(url_path, "dashboard.html"))
 
 
 def local_ip_hint() -> str | None:
@@ -2985,6 +2241,7 @@ def main() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_DB.parent.mkdir(parents=True, exist_ok=True)
+    SCHEDULE_FILE.parent.mkdir(parents=True, exist_ok=True)
     ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
     explicit_port = args.port is not None or "EASM_WEB_PORT" in os.environ
     port = args.port if args.port is not None else DEFAULT_WEB_PORT
@@ -3018,11 +2275,19 @@ def main() -> None:
         print("Shared token login enabled via EASM_WEB_TOKEN.")
     else:
         print("Initial admin setup required at /setup before employees can use the portal.")
+    scheduler_thread = None
+    if SCHEDULE_POLL_SECONDS > 0:
+        scheduler_thread = threading.Thread(target=schedule_loop, name="scan-scheduler", daemon=True)
+        scheduler_thread.start()
+        print(f"Scheduled scan runner enabled every {max(30, SCHEDULE_POLL_SECONDS)} seconds.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping web console.")
     finally:
+        SCHEDULER_STOP.set()
+        if scheduler_thread:
+            scheduler_thread.join(timeout=2)
         EXECUTOR.shutdown(wait=False, cancel_futures=False)
         server.server_close()
 

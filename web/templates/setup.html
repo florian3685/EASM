@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Setup link-ed.it CyberScan</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script defer src="/static/js/common.js"></script>
+  <script defer src="/static/js/auth.js"></script>
+</head>
+<body class="auth-body">
+  <button class="theme-toggle auth-theme" type="button" data-theme-toggle aria-label="Toggle theme"></button>
+  <main class="auth-card">
+    <div class="auth-logo"><img src="/static/img/link-ed.it-logo.png" alt="link-ed.it Consulting & Services"></div>
+    <h1>Initial Admin Setup</h1>
+    <p class="auth-copy">Create the first internal employee admin for link-ed.it CyberScan.</p>
+    __ERROR_HTML__
+    <form method="post" action="/setup">
+      <div class="field">
+        <label for="username">Admin user</label>
+        <input id="username" name="username" type="text" autocomplete="username" autofocus>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label for="confirm">Confirm password</label>
+        <input id="confirm" name="confirm" type="password" autocomplete="new-password">
+      </div>
+      <button class="primary" type="submit"><i data-lucide="user-plus"></i>Create admin</button>
+    </form>
+  </main>
+</body>
+</html>
